@@ -1,0 +1,339 @@
+import numpy as np
+import torch
+from .line_representation import Line3D
+from .spatial_partitioning import find_potential_intersections
+from .cuda_kernels import (
+    get_line_parameters_tensor,
+    find_intersections_cuda,
+    merge_nearby_intersections_cuda,
+    backproject_hits_cuda,
+    project_volume_cuda
+)
+
+class LineIntersectionSolver:
+    """
+    Solver for finding intersections of backprojected lines from multiple wire planes in LArTPC.
+    """
+    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda'):
+        """
+        Initialize the solver.
+        
+        Args:
+            volume_shape (tuple): Shape of the 3D volume (N, N, N)
+            tolerance (float): Tolerance for intersection testing in mm
+            merge_tolerance (float): Tolerance for merging nearby intersections in mm
+            device (str): Device to use ('cuda' or 'cpu')
+        """
+        self.volume_shape = volume_shape
+        self.tolerance = tolerance
+        self.merge_tolerance = merge_tolerance
+        self.device = device
+        
+        # Set volume bounds
+        self.volume_min = np.zeros(3, dtype=np.float32)
+        self.volume_max = np.array(volume_shape, dtype=np.float32)
+        
+        # Initialize standard wire plane angles (in radians)
+        self.plane_angles = {
+            0: 0.0,                  # 0 degrees (vertical)
+            1: np.pi/2,              # 90 degrees (horizontal)
+            2: np.pi/3,              # 60 degrees
+            3: 2*np.pi/3             # 120 degrees
+        }
+        
+        # Initialize u_min values for each plane
+        # These ensure nonnegative indices in the projections
+        self.u_min_values = {}
+        for plane_id, theta in self.plane_angles.items():
+            # Compute maximum possible u-coordinate for this plane
+            sin_theta = np.sin(theta)
+            cos_theta = np.cos(theta)
+            
+            # Compute corners of the volume
+            corners = []
+            for x in [0, volume_shape[0]-1]:
+                for y in [0, volume_shape[1]-1]:
+                    for z in [0, volume_shape[2]-1]:
+                        corners.append(np.array([x, y, z]))
+            
+            # Compute u for each corner
+            u_values = [-sin_theta * corner[1] + cos_theta * corner[2] for corner in corners]
+            
+            # Set u_min to ensure nonnegative indices
+            self.u_min_values[plane_id] = np.floor(min(u_values))
+    
+    def project_volume_cuda(self, volume, theta, u_min, device=None):
+        """
+        Project a 3D volume to a 2D projection using CUDA.
+        
+        Args:
+            volume (torch.Tensor): 3D volume of shape (N, N, N)
+            theta (float): Angle of the wire plane in radians
+            u_min (float): Minimum u-coordinate
+            device (str, optional): Device to use ('cuda' or 'cpu'). If None, use the solver's device.
+            
+        Returns:
+            torch.Tensor: 2D projection of shape (N, U) where U depends on the projection
+        """
+        if device is None:
+            device = self.device
+        
+        return project_volume_cuda(volume, theta, u_min, device)
+    
+    def backproject_plane(self, projection_data, plane_id):
+        """
+        Backproject hits from a wire plane into 3D lines.
+        
+        Args:
+            projection_data (torch.Tensor): 2D projection data (x, u)
+            plane_id (int): ID of the wire plane
+            
+        Returns:
+            tuple: (points, directions, plane_ids) representing the backprojected lines
+        """
+        theta = self.plane_angles[plane_id]
+        u_min = self.u_min_values[plane_id]
+        
+        return backproject_hits_cuda(
+            projection_data,
+            theta,
+            u_min,
+            self.volume_shape,
+            device=self.device
+        )
+    
+    def find_intersections(self, projections):
+        """
+        Find intersections between backprojected lines from multiple wire planes.
+        
+        Args:
+            projections (dict): Dictionary mapping plane_id to projection data
+            
+        Returns:
+            torch.Tensor: Intersection points (N, 3)
+        """
+        # Convert projections to lines
+        all_points = []
+        all_directions = []
+        all_plane_ids = []
+        
+        for plane_id, projection in projections.items():
+            points, directions, plane_ids = self.backproject_plane(projection, plane_id)
+            all_points.append(points)
+            all_directions.append(directions)
+            all_plane_ids.append(plane_ids)
+        
+        # Concatenate all lines
+        all_points = torch.cat(all_points, dim=0)
+        all_directions = torch.cat(all_directions, dim=0)
+        all_plane_ids = torch.cat(all_plane_ids, dim=0)
+        
+        # Find all pairwise intersections
+        intersection_points = []
+        intersection_distances = []
+        
+        # Find intersections between lines from different planes
+        for i in range(len(projections)):
+            for j in range(i + 1, len(projections)):
+                # Get line parameters for each plane
+                plane_id1 = list(projections.keys())[i]
+                plane_id2 = list(projections.keys())[j]
+                
+                mask1 = all_plane_ids == plane_id1
+                mask2 = all_plane_ids == plane_id2
+                
+                points1 = all_points[mask1]
+                directions1 = all_directions[mask1]
+                plane_ids1 = all_plane_ids[mask1]
+                
+                points2 = all_points[mask2]
+                directions2 = all_directions[mask2]
+                plane_ids2 = all_plane_ids[mask2]
+                
+                # Find intersections
+                points, indices1, indices2, distances = find_intersections_cuda(
+                    points1, directions1, plane_ids1,
+                    points2, directions2, plane_ids2,
+                    self.tolerance, self.device
+                )
+                
+                intersection_points.append(points)
+                intersection_distances.append(distances)
+        
+        # Concatenate all intersection points
+        if intersection_points:
+            all_intersection_points = torch.cat(intersection_points, dim=0)
+            all_distances = torch.cat(intersection_distances, dim=0)
+            
+            # Merge nearby intersections
+            merged_points = merge_nearby_intersections_cuda(
+                all_intersection_points,
+                all_distances,
+                self.merge_tolerance
+            )
+            
+            return merged_points
+        else:
+            return torch.zeros((0, 3), device=self.device)
+
+    def solve_inverse_problem(self, projections):
+        """
+        Solve the inverse problem: find 3D points that are consistent with
+        intersections of backprojected lines from different wire planes.
+        
+        Args:
+            projections (dict): Dictionary mapping plane_id to projection data
+            
+        Returns:
+            torch.Tensor: 3D points that are consistent with the projections
+        """
+        # Find intersections between backprojected lines
+        intersection_points = self.find_intersections(projections)
+        
+        # Filter out points outside the volume
+        if intersection_points.size(0) > 0:
+            # Convert volume bounds to tensors
+            volume_min = torch.tensor(self.volume_min, device=self.device)
+            volume_max = torch.tensor(self.volume_max, device=self.device)
+            
+            # Create masks for points inside the volume
+            inside_min = torch.all(intersection_points >= volume_min, dim=1)
+            inside_max = torch.all(intersection_points < volume_max, dim=1)
+            inside_volume = inside_min & inside_max
+            
+            # Filter points
+            filtered_points = intersection_points[inside_volume]
+            
+            return filtered_points
+        else:
+            return intersection_points
+    
+    def lines_from_numpy_array(self, array, plane_id):
+        """
+        Convert a numpy array of line parameters to Line3D objects.
+        
+        Args:
+            array (np.ndarray): Array of shape (N, 6) containing line parameters
+                               (point_x, point_y, point_z, dir_x, dir_y, dir_z)
+            plane_id (int): ID of the wire plane
+            
+        Returns:
+            list: List of Line3D objects
+        """
+        lines = []
+        for i in range(array.shape[0]):
+            point = array[i, 0:3]
+            direction = array[i, 3:6]
+            line = Line3D(point, direction, plane_id)
+            lines.append(line)
+        
+        return lines
+    
+    def intersect_lines_cpu(self, lines_by_plane):
+        """
+        Find intersections between lines from different planes using CPU.
+        This is a slower alternative to the CUDA implementation.
+        
+        Args:
+            lines_by_plane (dict): Dictionary mapping plane_id to list of Line3D objects
+            
+        Returns:
+            np.ndarray: Intersection points (N, 3)
+        """
+        # Use spatial partitioning to find potential intersections
+        candidates = find_potential_intersections(
+            lines_by_plane,
+            self.tolerance,
+            (self.volume_min, self.volume_max)
+        )
+        
+        # Compute actual intersections
+        intersection_points = []
+        distances = []
+        
+        for line1, line2 in candidates:
+            # Skip lines from the same plane
+            if line1.plane_id == line2.plane_id:
+                continue
+            
+            # Compute closest points between the lines
+            # This is done by solving a 2x2 linear system
+            
+            # Get line parameters
+            p1 = line1.point
+            d1 = line1.direction
+            p2 = line2.point
+            d2 = line2.direction
+            
+            # Compute coefficients of the 2x2 linear system
+            # [a, b; c, d] * [t1; t2] = [e; f]
+            
+            a = np.dot(d1, d1)
+            b = -np.dot(d1, d2)
+            c = b
+            d = np.dot(d2, d2)
+            
+            dp = p2 - p1
+            e = np.dot(dp, d1)
+            f = -np.dot(dp, d2)
+            
+            # Compute determinant
+            det = a * d - b * c
+            
+            # Handle parallel lines
+            if abs(det) < 1e-10:
+                continue
+            
+            # Solve for t1 and t2
+            t1 = (d * e - b * f) / det
+            t2 = (a * f - c * e) / det
+            
+            # Compute closest points
+            closest1 = p1 + t1 * d1
+            closest2 = p2 + t2 * d2
+            
+            # Compute distance between closest points
+            distance = np.linalg.norm(closest1 - closest2)
+            
+            # If distance is below tolerance, consider it an intersection
+            if distance <= self.tolerance:
+                # Compute intersection point as midpoint of closest points
+                intersection = (closest1 + closest2) / 2
+                intersection_points.append(intersection)
+                distances.append(distance)
+        
+        # Convert to numpy arrays
+        if intersection_points:
+            intersection_points = np.array(intersection_points)
+            distances = np.array(distances)
+            
+            # Merge nearby intersections (simple clustering)
+            # This is a simplified version of the CUDA implementation
+            from sklearn.cluster import DBSCAN
+            
+            if intersection_points.shape[0] > 1:
+                # Use DBSCAN for clustering
+                clustering = DBSCAN(eps=self.merge_tolerance, min_samples=1).fit(intersection_points)
+                labels = clustering.labels_
+                
+                # Compute cluster centers
+                unique_labels = np.unique(labels)
+                merged_points = np.zeros((len(unique_labels), 3), dtype=np.float32)
+                
+                for i, label in enumerate(unique_labels):
+                    mask = labels == label
+                    points = intersection_points[mask]
+                    point_distances = distances[mask]
+                    
+                    # Use inverse distances as weights
+                    weights = 1.0 / (point_distances + 1e-10)
+                    weights /= np.sum(weights)
+                    
+                    # Compute weighted average
+                    merged_points[i] = np.sum(points * weights[:, np.newaxis], axis=0)
+                
+                return merged_points
+            else:
+                return intersection_points
+        else:
+            return np.zeros((0, 3), dtype=np.float32) 
