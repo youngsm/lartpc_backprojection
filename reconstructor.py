@@ -9,7 +9,7 @@ class LArTPCReconstructor:
     A high-level class that combines methods for projecting, backprojecting,
     and finding intersections for LArTPC reconstruction.
     """
-    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False):
+    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False, plane_angles=None):
         """
         Initialize the reconstructor.
         
@@ -19,12 +19,15 @@ class LArTPCReconstructor:
             merge_tolerance (float): Tolerance for merging nearby intersections in mm
             device (str): Device to use ('cuda' or 'cpu')
             debug (bool): Whether to print debug information
+            plane_angles (dict, optional): Dictionary mapping plane_id to angle in radians.
+                                        If None, uses default angles (0°, 90°, 60°, 120°).
         """
         self.volume_shape = volume_shape
         self.tolerance = tolerance
         self.merge_tolerance = merge_tolerance
         self.device = device
         self.debug = debug
+        self.plane_angles = plane_angles
         
         # Create the solver
         self.solver = LineIntersectionSolver(
@@ -32,8 +35,19 @@ class LArTPCReconstructor:
             tolerance,
             merge_tolerance,
             device,
-            debug=debug
+            debug=debug,
+            plane_angles=plane_angles
         )
+    
+    def set_plane_angles(self, plane_angles):
+        """
+        Update the plane angles used for projection and backprojection.
+        
+        Args:
+            plane_angles (dict): Dictionary mapping plane_id to angle in radians
+        """
+        self.plane_angles = plane_angles
+        self.solver.set_plane_angles(plane_angles)
     
     def project_volume(self, volume):
         """
@@ -65,8 +79,6 @@ class LArTPCReconstructor:
             # Project volume for each plane
             result = {}
             for plane_id, theta in self.solver.plane_angles.items():
-                if plane_id > 2:  # Only use the first 3 planes (0, 1, 2)
-                    continue
                 u_min = self.solver.u_min_values[plane_id]
                 result[plane_id] = self.solver.project_volume_cuda(volume, theta, u_min)
         
@@ -101,9 +113,6 @@ class LArTPCReconstructor:
         # Project volume for each plane
         projections = {}
         for plane_id, theta in self.solver.plane_angles.items():
-            if plane_id > 2:  # Only use the first 3 planes (0, 1, 2)
-                continue
-                
             if self.debug:
                 plane_start = time.time()
                 print(f"  Projecting to plane {plane_id} (theta={theta:.2f})...")
@@ -127,7 +136,7 @@ class LArTPCReconstructor:
         
         return projections
     
-    def reconstruct_from_projections(self, projections, threshold=0.1, fast_merge=True):
+    def reconstruct_from_projections(self, projections, threshold=0.1, fast_merge=True, snap_to_grid=True):
         """
         Reconstruct 3D points from 2D projections.
         
@@ -135,6 +144,7 @@ class LArTPCReconstructor:
             projections (dict): Dictionary mapping plane_id to projection data
             threshold (float): Threshold for considering a hit in the projections
             fast_merge (bool): Whether to use fast merge mode (much faster but slightly less precise)
+            snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
             torch.Tensor: Reconstructed 3D points
@@ -146,6 +156,8 @@ class LArTPCReconstructor:
                 print("Using FAST merge mode for maximum speed")
             else:
                 print("Using PRECISE merge mode (slower but more accurate)")
+            if snap_to_grid:
+                print("Snapping intersection points to nearest grid points")
         
         # Apply threshold to create binary hit maps
         thresholded_projections = {}
@@ -171,7 +183,7 @@ class LArTPCReconstructor:
             print(f"  Solving inverse problem...")
         
         # Solve the inverse problem
-        reconstructed_points = self.solver.solve_inverse_problem(thresholded_projections, fast_merge=fast_merge)
+        reconstructed_points = self.solver.solve_inverse_problem(thresholded_projections, fast_merge=fast_merge, snap_to_grid=snap_to_grid)
         
         if self.debug:
             end_time = time.time()
@@ -180,7 +192,7 @@ class LArTPCReconstructor:
         
         return reconstructed_points
     
-    def reconstruct_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True):
+    def reconstruct_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True, use_gaussian=True, snap_to_grid=True):
         """
         Reconstruct a 3D volume from 2D projections by placing voxels at intersection points.
         
@@ -188,7 +200,9 @@ class LArTPCReconstructor:
             projections (dict): Dictionary mapping plane_id to projection data
             threshold (float): Threshold for considering a hit in the projections
             voxel_size (float): Size of the voxels to place at intersection points
-            fast_merge (bool): Whether to use fast merge mode (much faster but slightly less precise)
+            fast_merge (bool): Whether to use fast merge mode for clustering
+            use_gaussian (bool): Whether to place Gaussian blobs at each point (True) or just single voxels (False)
+            snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
             torch.Tensor: Reconstructed 3D volume
@@ -196,9 +210,12 @@ class LArTPCReconstructor:
         if self.debug:
             start_time = time.time()
             print(f"Reconstructing 3D volume from projections...")
+            print(f"  Using {'Gaussian blobs' if use_gaussian else 'single voxels'} for reconstruction")
+            if snap_to_grid:
+                print(f"  Snapping intersection points to nearest grid points")
         
         # Reconstruct 3D points
-        points = self.reconstruct_from_projections(projections, threshold, fast_merge)
+        points = self.reconstruct_from_projections(projections, threshold, fast_merge, snap_to_grid)
         
         if self.debug:
             points_time = time.time()
@@ -214,8 +231,13 @@ class LArTPCReconstructor:
                 print("  No points reconstructed, returning empty volume")
             return volume
         
-        # Round points to nearest voxel indices
-        indices = torch.round(points / voxel_size).long()
+        # Round points to nearest voxel indices if not already snapped to grid
+        if snap_to_grid and voxel_size == 1.0:
+            # Points are already on the grid, just convert to long
+            indices = points.long()
+        else:
+            # Round points to nearest voxel indices
+            indices = torch.round(points / voxel_size).long()
         
         # Clamp indices to be within the volume
         indices = torch.clamp(
@@ -227,71 +249,88 @@ class LArTPCReconstructor:
         if self.debug:
             indices_time = time.time()
             print(f"  Computed voxel indices in {indices_time - points_time:.2f} seconds")
-            print(f"  Creating point map...")
         
-        # Place voxels in the volume efficiently using a sparse approach
-        # First, create a map of all points in a tensor
-        point_map = torch.zeros((self.volume_shape[0], self.volume_shape[1], self.volume_shape[2]), 
-                               dtype=torch.bool, device=self.device)
-        
-        # Mark locations of points
-        if indices.shape[0] > 0:
-            point_map[indices[:, 0], indices[:, 1], indices[:, 2]] = True
-        
-        # Find indices of all points
-        point_indices = torch.nonzero(point_map, as_tuple=True)
+        if use_gaussian:
+            # Place Gaussian blobs at each point
+            if self.debug:
+                print(f"  Creating point map for Gaussian blobs...")
+                
+            # First, create a map of all points in a tensor
+            point_map = torch.zeros((self.volume_shape[0], self.volume_shape[1], self.volume_shape[2]), 
+                                   dtype=torch.bool, device=self.device)
+            
+            # Mark locations of points
+            if indices.shape[0] > 0:
+                point_map[indices[:, 0], indices[:, 1], indices[:, 2]] = True
+            
+            # Find indices of all points
+            point_indices = torch.nonzero(point_map, as_tuple=True)
+            
+            if self.debug:
+                map_time = time.time()
+                print(f"  Created point map with {len(point_indices[0])} unique locations in {map_time - indices_time:.2f} seconds")
+                print(f"  Placing Gaussian blobs...")
+            
+            # For each marked point, place a Gaussian blob
+            sigma = max(1.0, voxel_size)
+            radius = int(2 * sigma)
+            
+            # Create a Gaussian kernel for efficiency
+            kernel_size = 2 * radius + 1
+            kernel_1d = torch.exp(-torch.arange(-radius, radius + 1, device=self.device)**2 / (2 * sigma**2))
+            # Normalize kernel
+            kernel_1d = kernel_1d / kernel_1d.sum()
+            
+            # Use separable 3D convolution for efficiency
+            for i in range(len(point_indices[0])):
+                x, y, z = point_indices[0][i], point_indices[1][i], point_indices[2][i]
+                
+                # Calculate ranges for the Gaussian blob with bounds checking
+                x_min, x_max = max(0, x - radius), min(self.volume_shape[0] - 1, x + radius)
+                y_min, y_max = max(0, y - radius), min(self.volume_shape[1] - 1, y + radius)
+                z_min, z_max = max(0, z - radius), min(self.volume_shape[2] - 1, z + radius)
+                
+                # Calculate kernel indices
+                kx_min, kx_max = radius - (x - x_min), radius + (x_max - x)
+                ky_min, ky_max = radius - (y - y_min), radius + (y_max - y)
+                kz_min, kz_max = radius - (z - z_min), radius + (z_max - z)
+                
+                # Get kernel values
+                kx = kernel_1d[kx_min:kx_max+1]
+                ky = kernel_1d[ky_min:ky_max+1]
+                kz = kernel_1d[kz_min:kz_max+1]
+                
+                # Calculate 3D Gaussian values using outer products
+                for dx, kx_val in enumerate(kx):
+                    for dy, ky_val in enumerate(ky):
+                        for dz, kz_val in enumerate(kz):
+                            nx, ny, nz = x_min + dx, y_min + dy, z_min + dz
+                            value = kx_val * ky_val * kz_val
+                            volume[nx, ny, nz] = max(volume[nx, ny, nz], value)
+            
+            if self.debug:
+                blob_time = time.time()
+                print(f"  Placed Gaussian blobs in {blob_time - map_time:.2f} seconds")
+        else:
+            # Just place single voxels at each point (no Gaussian blobs)
+            if self.debug:
+                print(f"  Placing single voxels at {indices.shape[0]} points...")
+            
+            # Set all voxels to 1.0 (or you could use a different value if needed)
+            volume[indices[:, 0], indices[:, 1], indices[:, 2]] = 1.0
+            
+            if self.debug:
+                voxel_time = time.time()
+                print(f"  Placed single voxels in {voxel_time - indices_time:.2f} seconds")
         
         if self.debug:
-            map_time = time.time()
-            print(f"  Created point map with {len(point_indices[0])} unique locations in {map_time - indices_time:.2f} seconds")
-            print(f"  Placing Gaussian blobs...")
-        
-        # For each marked point, place a Gaussian blob
-        sigma = max(1.0, voxel_size)
-        radius = int(2 * sigma)
-        
-        # Create a Gaussian kernel for efficiency
-        kernel_size = 2 * radius + 1
-        kernel_1d = torch.exp(-torch.arange(-radius, radius + 1, device=self.device)**2 / (2 * sigma**2))
-        # Normalize kernel
-        kernel_1d = kernel_1d / kernel_1d.sum()
-        
-        # Use separable 3D convolution for efficiency
-        for i in range(len(point_indices[0])):
-            x, y, z = point_indices[0][i], point_indices[1][i], point_indices[2][i]
-            
-            # Calculate ranges for the Gaussian blob with bounds checking
-            x_min, x_max = max(0, x - radius), min(self.volume_shape[0] - 1, x + radius)
-            y_min, y_max = max(0, y - radius), min(self.volume_shape[1] - 1, y + radius)
-            z_min, z_max = max(0, z - radius), min(self.volume_shape[2] - 1, z + radius)
-            
-            # Calculate kernel indices
-            kx_min, kx_max = radius - (x - x_min), radius + (x_max - x)
-            ky_min, ky_max = radius - (y - y_min), radius + (y_max - y)
-            kz_min, kz_max = radius - (z - z_min), radius + (z_max - z)
-            
-            # Get kernel values
-            kx = kernel_1d[kx_min:kx_max+1]
-            ky = kernel_1d[ky_min:ky_max+1]
-            kz = kernel_1d[kz_min:kz_max+1]
-            
-            # Calculate 3D Gaussian values using outer products
-            for dx, kx_val in enumerate(kx):
-                for dy, ky_val in enumerate(ky):
-                    for dz, kz_val in enumerate(kz):
-                        nx, ny, nz = x_min + dx, y_min + dy, z_min + dz
-                        value = kx_val * ky_val * kz_val
-                        volume[nx, ny, nz] = max(volume[nx, ny, nz], value)
-        
-        if self.debug:
-            blob_time = time.time()
-            print(f"  Placed Gaussian blobs in {blob_time - map_time:.2f} seconds")
+            end_time = time.time()
             print(f"  Non-zero voxels in reconstructed volume: {torch.count_nonzero(volume).item()}")
-            print(f"Total volume reconstruction time: {blob_time - start_time:.2f} seconds")
+            print(f"Total volume reconstruction time: {end_time - start_time:.2f} seconds")
         
         return volume
     
-    def reconstruct_sparse_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True):
+    def reconstruct_sparse_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True, use_gaussian=True, snap_to_grid=True):
         """
         Reconstruct a sparse 3D volume from 2D projections by placing voxels at intersection points.
         Uses vectorized operations for better performance.
@@ -300,7 +339,9 @@ class LArTPCReconstructor:
             projections (dict): Dictionary mapping plane_id to projection data
             threshold (float): Threshold for considering a hit in the projections
             voxel_size (float): Size of the voxels to place at intersection points
-            fast_merge (bool): Whether to use fast merge mode (much faster but slightly less precise)
+            fast_merge (bool): Whether to use fast merge mode for clustering
+            use_gaussian (bool): Whether to place Gaussian blobs at each point (True) or just single voxels (False)
+            snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
             tuple: (coords, values, shape) representing the sparse reconstructed volume
@@ -308,9 +349,12 @@ class LArTPCReconstructor:
         if self.debug:
             start_time = time.time()
             print(f"Reconstructing sparse 3D volume from projections...")
+            print(f"  Using {'Gaussian blobs' if use_gaussian else 'single voxels'} for reconstruction")
+            if snap_to_grid:
+                print(f"  Snapping intersection points to nearest grid points")
         
         # Reconstruct 3D points
-        points = self.reconstruct_from_projections(projections, threshold, fast_merge)
+        points = self.reconstruct_from_projections(projections, threshold, fast_merge, snap_to_grid)
         
         if self.debug:
             points_time = time.time()
@@ -329,8 +373,13 @@ class LArTPCReconstructor:
         if self.debug:
             print(f"  Creating sparse volume with voxel size {voxel_size}...")
         
-        # Round points to nearest voxel indices
-        indices = torch.round(points / voxel_size).long()
+        # Round points to nearest voxel indices if not already snapped to grid
+        if snap_to_grid and voxel_size == 1.0:
+            # Points are already on the grid, just convert to long
+            indices = points.long()
+        else:
+            # Round points to nearest voxel indices
+            indices = torch.round(points / voxel_size).long()
         
         # Clamp indices to be within the volume
         indices = torch.clamp(
@@ -338,6 +387,41 @@ class LArTPCReconstructor:
             min=torch.zeros(3, device=self.device).long(),
             max=torch.tensor(self.volume_shape, device=self.device).long() - 1
         )
+        
+        if self.debug:
+            indices_time = time.time()
+            print(f"  Computed voxel indices in {indices_time - points_time:.2f} seconds")
+        
+        if not use_gaussian:
+            # Just use the voxel indices directly without Gaussian blobs
+            if self.debug:
+                indices_time = time.time()
+                print(f"  Using direct voxel indices without Gaussian blobs")
+                
+            # Create a unique identifier for each voxel to remove duplicates
+            voxel_ids = (
+                indices[:, 0] * self.volume_shape[1] * self.volume_shape[2] +
+                indices[:, 1] * self.volume_shape[2] +
+                indices[:, 2]
+            )
+            
+            # Get unique voxels
+            unique_ids, inverse_indices = torch.unique(voxel_ids, return_inverse=True)
+            
+            # Create sparse volume representation
+            unique_coords = torch.zeros((len(unique_ids), 3), dtype=torch.long, device=self.device)
+            unique_values = torch.ones(len(unique_ids), device=self.device)  # All voxels have value 1.0
+            
+            # Get coordinates for each unique voxel
+            for i, voxel_id in enumerate(unique_ids):
+                mask = (voxel_ids == voxel_id)
+                unique_coords[i] = indices[mask][0]  # Take first occurrence
+            
+            if self.debug:
+                end_time = time.time()
+                print(f"  Created sparse volume with {len(unique_ids)} voxels in {end_time - points_time:.2f} seconds")
+            
+            return (unique_coords, unique_values, self.volume_shape)
         
         # Parameters for Gaussian blobs
         sigma = max(1.0, voxel_size)
@@ -524,18 +608,19 @@ class LArTPCReconstructor:
             'num_intersection': num_intersection
         }
     
-    def reconstruct_from_lines(self, lines_by_plane):
+    def reconstruct_from_lines(self, lines_by_plane, snap_to_grid=True):
         """
         Reconstruct 3D points from line objects directly.
         
         Args:
             lines_by_plane (dict): Dictionary mapping plane_id to lists of Line3D objects
+            snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
             np.ndarray: Reconstructed 3D points
         """
         # Find intersections using CPU
-        intersection_points = self.solver.intersect_lines_cpu(lines_by_plane)
+        intersection_points = self.solver.intersect_lines_cpu(lines_by_plane, snap_to_grid)
         
         return intersection_points
     

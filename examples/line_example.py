@@ -160,7 +160,7 @@ def run_line_example(debug=True, fast_merge=True):
     # 4. Reconstruct 3D points from projections
     print("\n4. Reconstructing 3D points from projections...")
     start_time = time()
-    reconstructed_points = reconstructor.reconstruct_from_projections(projections, threshold=0.1, fast_merge=fast_merge)
+    reconstructed_points = reconstructor.reconstruct_from_projections(projections, threshold=1.0, fast_merge=fast_merge)
     print(f"Reconstructed {reconstructed_points.size(0)} points in {time() - start_time:.2f} seconds")
     
     # Visualize original vs reconstructed points
@@ -227,7 +227,7 @@ def run_line_example(debug=True, fast_merge=True):
     start_time = time()
     
     # Use sparse reconstruction
-    reconstructed_sparse_volume = reconstructor.reconstruct_sparse_volume(projections, threshold=0.1, voxel_size=1.0, fast_merge=fast_merge)
+    reconstructed_sparse_volume = reconstructor.reconstruct_sparse_volume(projections, threshold=1.0, voxel_size=1.0, fast_merge=fast_merge, use_gaussian=False)
     reconstructed_coords, reconstructed_values, _ = reconstructed_sparse_volume
     
     # Convert to dense for visualization
@@ -245,7 +245,7 @@ def run_line_example(debug=True, fast_merge=True):
     
     # 6. Evaluate the reconstruction
     print("\n6. Evaluating reconstruction...")
-    metrics = reconstructor.evaluate_reconstruction(dense_volume, reconstructed_volume, threshold=0.1)
+    metrics = reconstructor.evaluate_reconstruction(dense_volume, reconstructed_volume, threshold=1.0)
     print("Evaluation metrics:")
     for metric, value in metrics.items():
         print(f"  {metric}: {value:.4f}")

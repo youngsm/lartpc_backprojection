@@ -115,7 +115,8 @@ def find_intersections_cuda(
     plane_ids2,
     tolerance=1.0,
     device="cuda",
-    debug=False
+    debug=False,
+    snap_to_grid=True
 ):
     """
     Find intersections between two sets of lines using CUDA.
@@ -130,6 +131,7 @@ def find_intersections_cuda(
         tolerance (float): Tolerance for intersection testing
         device (str): Device to use ('cuda' or 'cpu')
         debug (bool): Whether to print debug information
+        snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
         
     Returns:
         tuple: (intersection_points, line_indices1, line_indices2, distances)
@@ -171,12 +173,18 @@ def find_intersections_cuda(
     # Compute intersection points as midpoints of closest points
     intersection_points = (closest1[valid_mask] + closest2[valid_mask]) / 2.0
     
+    # Snap intersection points to the nearest grid points if requested
+    if snap_to_grid:
+        intersection_points = torch.round(intersection_points)
+    
     # Get distances of valid intersections
     valid_distances = distances[valid_mask]
     
     if debug:
         end_time = time.time()
         print(f"  Extracted valid intersections in {end_time - mask_time:.2f} seconds")
+        if snap_to_grid:
+            print(f"  Snapped intersection points to nearest grid points")
         print(f"  Total intersection processing time: {end_time - start_time:.2f} seconds")
     
     return intersection_points, line_indices1, line_indices2, valid_distances
@@ -611,17 +619,18 @@ def _merge_nearby_intersections_fast(intersection_points, distances, tolerance=1
     return final_centers
 
 
-def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="cuda"):
+def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="cuda", plane_id=None):
     """
     Backproject 2D hits into 3D lines using CUDA.
-
+    
     Args:
         projection_data (torch.Tensor): 2D projection data (x, u)
         theta (float): Angle of the wire plane in radians
         u_min (float): Minimum u-coordinate
         volume_shape (tuple): Shape of the 3D volume (N, N, N)
         device (str): Device to use ('cuda' or 'cpu')
-
+        plane_id (int, optional): The ID of the wire plane. If None, will be set to 0.
+        
     Returns:
         tuple: (points, directions, plane_id) representing the backprojected lines
     """
@@ -629,21 +638,21 @@ def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="c
     hits = torch.nonzero(projection_data > 0, as_tuple=True)
     x_indices = hits[0]
     u_indices = hits[1]
-
+    
     # Create line parameters
     sin_theta = math.sin(theta)
     cos_theta = math.cos(theta)
-
+    
     # Number of hits
     n_hits = x_indices.size(0)
-
+    
     # For each hit, compute a point on the line
     points = torch.zeros((n_hits, 3), device=device)
     points[:, 0] = x_indices.float()  # x-coordinate is preserved
-
+    
     # Compute u-coordinate in the original space
     u_orig = u_indices.float() + u_min
-
+    
     # For the vertical case (theta = 0), u = z
     if abs(sin_theta) < 1e-10:
         points[:, 1] = 0.0  # y = 0
@@ -657,23 +666,23 @@ def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="c
         # Choose a point where either y=0 or z=0
         points[:, 1] = 0.0  # y = 0
         points[:, 2] = u_orig / cos_theta  # z = u / cos(theta)
-
+    
     # Compute direction vectors (perpendicular to the wire direction)
     directions = torch.zeros((n_hits, 3), device=device)
     directions[:, 0] = 0.0  # Perpendicular to x (the drift direction)
     directions[:, 1] = cos_theta  # y-component
     directions[:, 2] = sin_theta  # z-component
-
+    
     # Normalize directions
-    norm = torch.sqrt(torch.sum(directions**2, dim=1, keepdim=True))
+    norm = torch.sqrt(torch.sum(directions ** 2, dim=1, keepdim=True))
     directions = directions / norm
-
-    # Set plane ID
-    plane_id = torch.ones(n_hits, device=device, dtype=torch.int32) * (
-        0 if theta == 0 else (1 if theta == math.pi / 2 else 2)
-    )
-
-    return points, directions, plane_id
+    
+    # Set plane ID (use provided plane_id or default to 0)
+    if plane_id is None:
+        plane_id = 0
+    plane_ids = torch.ones(n_hits, device=device, dtype=torch.int32) * plane_id
+    
+    return points, directions, plane_ids
 
 
 def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, device='cuda'):
@@ -699,7 +708,7 @@ def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, devic
     N = volume_shape[0]
     
     # Extract coordinates
-    x = coords[:, 0]
+    x = coords[:, 0].long()
     y = coords[:, 1]
     z = coords[:, 2]
     
@@ -712,14 +721,19 @@ def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, devic
     # Determine the size of the projection
     u_max = int(torch.max(u).item()) + 1
     
-    # Create the projection tensor
-    projection = torch.zeros((N, u_max), device=device)
+    # Create 2D indices for the sparse tensor
+    indices = torch.stack([x, u], dim=0)
     
-    # Use direct indexing for efficient accumulation
-    for i in range(coords.shape[0]):
-        x_idx = x[i]
-        u_idx = u[i]
-        projection[x_idx, u_idx] += values[i]
+    # Create a sparse tensor and convert to dense
+    sparse_projection = torch.sparse_coo_tensor(
+        indices=indices,
+        values=values,
+        size=(N, u_max),
+        device=device
+    )
+    
+    # Convert to dense tensor
+    projection = sparse_projection.to_dense()
     
     return projection
 

@@ -259,7 +259,7 @@ def run_full_pipeline(debug=True, fast_merge=True):
     start_time = time()
     
     # Use sparse reconstruction
-    reconstructed_sparse_volume = reconstructor.reconstruct_sparse_volume(projections, threshold=0.1, voxel_size=1.0, fast_merge=fast_merge)
+    reconstructed_sparse_volume = reconstructor.reconstruct_sparse_volume(projections, threshold=0.1, voxel_size=1.0, fast_merge=fast_merge, use_gaussian=False)
     reconstructed_coords, reconstructed_values, _ = reconstructed_sparse_volume
     
     # Convert to dense for visualization

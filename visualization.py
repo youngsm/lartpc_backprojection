@@ -85,7 +85,7 @@ def visualize_projections(projections, figsize=(15, 5)):
         angle = angle_labels.get(plane_id, f'Plane {plane_id}')
         
         # Plot projection
-        im = axes[i].imshow(proj.T, aspect='auto', origin='lower', cmap='viridis')
+        im = axes[i].imshow(proj.T, aspect='auto', origin='lower', cmap='viridis', interpolation='none')
         axes[i].set_title(f'Projection ({angle})')
         axes[i].set_xlabel('X (drift)')
         axes[i].set_ylabel('U (wire)')
@@ -168,14 +168,6 @@ def visualize_lines_and_intersections(lines_by_plane, intersection_points, volum
     for plane_id, color in colors.items():
         if plane_id in lines_by_plane:
             label = f'Plane {plane_id}'
-            if plane_id == 0:
-                label = 'Vertical Plane (0°)'
-            elif plane_id == 1:
-                label = 'Horizontal Plane (90°)'
-            elif plane_id == 2:
-                label = '60° Plane'
-            elif plane_id == 3:
-                label = '120° Plane'
             
             from matplotlib.lines import Line2D
             legend_elements.append(Line2D([0], [0], color=color, lw=2, label=label))
@@ -230,6 +222,7 @@ def visualize_original_vs_reconstructed(original_points, reconstructed_points, v
             color='r',
             s=50,
             marker='x',
+            alpha=0.1,
             label='Reconstructed'
         )
     

@@ -15,7 +15,7 @@ class LineIntersectionSolver:
     """
     Solver for finding intersections of backprojected lines from multiple wire planes in LArTPC.
     """
-    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False):
+    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False, plane_angles=None):
         """
         Initialize the solver.
         
@@ -25,6 +25,8 @@ class LineIntersectionSolver:
             merge_tolerance (float): Tolerance for merging nearby intersections in mm
             device (str): Device to use ('cuda' or 'cpu')
             debug (bool): Whether to print debug information
+            plane_angles (dict, optional): Dictionary mapping plane_id to angle in radians.
+                                          If None, uses default angles (0°, 90°, 60°, 120°).
         """
         self.volume_shape = volume_shape
         self.tolerance = tolerance
@@ -37,15 +39,28 @@ class LineIntersectionSolver:
         self.volume_max = np.array(volume_shape, dtype=np.float32)
         
         # Initialize standard wire plane angles (in radians)
-        self.plane_angles = {
-            0: 0.0,                  # 0 degrees (vertical)
-            1: np.pi/6,              # 30 degrees (horizontal)
-            2: 5*np.pi/6,              # 150 degrees
-            # 3: 2*np.pi/3             # 120 degrees
-        }
-        
+        if plane_angles is None:
+            # Default angles
+            self.plane_angles = {
+                0: 0.0,                  # 0 degrees (vertical)
+                1: np.pi/2,              # 90 degrees (horizontal)
+                2: np.pi/3,              # 60 degrees
+                3: 2*np.pi/3             # 120 degrees
+            }
+        else:
+            # Use custom angles
+            self.plane_angles = plane_angles
+            
         # Initialize u_min values for each plane
         # These ensure nonnegative indices in the projections
+        self.u_min_values = {}
+        self._compute_u_min_values()
+    
+    def _compute_u_min_values(self):
+        """
+        Compute u_min values for each plane to ensure nonnegative indices in projections.
+        This should be called whenever plane angles are updated.
+        """
         self.u_min_values = {}
         for plane_id, theta in self.plane_angles.items():
             # Compute maximum possible u-coordinate for this plane
@@ -54,9 +69,9 @@ class LineIntersectionSolver:
             
             # Compute corners of the volume
             corners = []
-            for x in [0, volume_shape[0]-1]:
-                for y in [0, volume_shape[1]-1]:
-                    for z in [0, volume_shape[2]-1]:
+            for x in [0, self.volume_shape[0]-1]:
+                for y in [0, self.volume_shape[1]-1]:
+                    for z in [0, self.volume_shape[2]-1]:
                         corners.append(np.array([x, y, z]))
             
             # Compute u for each corner
@@ -64,6 +79,21 @@ class LineIntersectionSolver:
             
             # Set u_min to ensure nonnegative indices
             self.u_min_values[plane_id] = np.floor(min(u_values))
+    
+    def set_plane_angles(self, plane_angles):
+        """
+        Update the plane angles used for projection and backprojection.
+        
+        Args:
+            plane_angles (dict): Dictionary mapping plane_id to angle in radians
+        """
+        self.plane_angles = plane_angles
+        self._compute_u_min_values()
+        
+        if self.debug:
+            print("Updated plane angles:")
+            for plane_id, angle in self.plane_angles.items():
+                print(f"  Plane {plane_id}: {angle:.2f} radians ({angle * 180 / np.pi:.1f}°)")
     
     def project_volume_cuda(self, volume, theta, u_min, device=None):
         """
@@ -119,7 +149,8 @@ class LineIntersectionSolver:
             theta,
             u_min,
             self.volume_shape,
-            device=self.device
+            device=self.device,
+            plane_id=plane_id
         )
         
         if self.debug:
@@ -129,13 +160,14 @@ class LineIntersectionSolver:
         
         return points, directions, plane_ids
     
-    def find_intersections(self, projections, fast_merge=True):
+    def find_intersections(self, projections, fast_merge=True, snap_to_grid=True):
         """
         Find intersections between backprojected lines from multiple wire planes.
         
         Args:
             projections (dict): Dictionary mapping plane_id to projection data
             fast_merge (bool): Whether to use fast merge mode for clustering (much faster but slightly less precise)
+            snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
             torch.Tensor: Intersection points (N, 3)
@@ -211,7 +243,8 @@ class LineIntersectionSolver:
                 points, indices1, indices2, distances = find_intersections_cuda(
                     points1, directions1, plane_ids1,
                     points2, directions2, plane_ids2,
-                    self.tolerance, self.device, debug=self.debug
+                    self.tolerance, self.device, debug=self.debug,
+                    snap_to_grid=snap_to_grid
                 )
                 
                 if self.debug:
@@ -266,7 +299,7 @@ class LineIntersectionSolver:
             
             return torch.zeros((0, 3), device=self.device)
 
-    def solve_inverse_problem(self, projections, fast_merge=True):
+    def solve_inverse_problem(self, projections, fast_merge=True, snap_to_grid=True):
         """
         Solve the inverse problem: find 3D points that are consistent with
         intersections of backprojected lines from different wire planes.
@@ -274,6 +307,7 @@ class LineIntersectionSolver:
         Args:
             projections (dict): Dictionary mapping plane_id to projection data
             fast_merge (bool): Whether to use fast merge mode for clustering (much faster but slightly less precise)
+            snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
             torch.Tensor: 3D points that are consistent with the projections
@@ -285,9 +319,11 @@ class LineIntersectionSolver:
                 print("  Using FAST merge mode for maximum speed")
             else:
                 print("  Using PRECISE merge mode (slower but more accurate)")
+            if snap_to_grid:
+                print("  Snapping intersection points to nearest grid points")
         
         # Find intersections between backprojected lines
-        intersection_points = self.find_intersections(projections, fast_merge)
+        intersection_points = self.find_intersections(projections, fast_merge, snap_to_grid)
         
         # Filter out points outside the volume
         if intersection_points.size(0) > 0:
@@ -345,13 +381,14 @@ class LineIntersectionSolver:
         
         return lines
     
-    def intersect_lines_cpu(self, lines_by_plane):
+    def intersect_lines_cpu(self, lines_by_plane, snap_to_grid=True):
         """
         Find intersections between lines from different planes using CPU.
         This is a slower alternative to the CUDA implementation.
         
         Args:
             lines_by_plane (dict): Dictionary mapping plane_id to list of Line3D objects
+            snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
             np.ndarray: Intersection points (N, 3)
@@ -415,6 +452,11 @@ class LineIntersectionSolver:
             if distance <= self.tolerance:
                 # Compute intersection point as midpoint of closest points
                 intersection = (closest1 + closest2) / 2
+                
+                # Snap to grid if requested
+                if snap_to_grid:
+                    intersection = np.round(intersection)
+                
                 intersection_points.append(intersection)
                 distances.append(distance)
         
