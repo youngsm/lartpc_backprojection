@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import time
 from .line_representation import Line3D
 from .spatial_partitioning import find_potential_intersections
 from .cuda_kernels import (
@@ -14,7 +15,7 @@ class LineIntersectionSolver:
     """
     Solver for finding intersections of backprojected lines from multiple wire planes in LArTPC.
     """
-    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda'):
+    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False):
         """
         Initialize the solver.
         
@@ -23,11 +24,13 @@ class LineIntersectionSolver:
             tolerance (float): Tolerance for intersection testing in mm
             merge_tolerance (float): Tolerance for merging nearby intersections in mm
             device (str): Device to use ('cuda' or 'cpu')
+            debug (bool): Whether to print debug information
         """
         self.volume_shape = volume_shape
         self.tolerance = tolerance
         self.merge_tolerance = merge_tolerance
         self.device = device
+        self.debug = debug
         
         # Set volume bounds
         self.volume_min = np.zeros(3, dtype=np.float32)
@@ -36,9 +39,9 @@ class LineIntersectionSolver:
         # Initialize standard wire plane angles (in radians)
         self.plane_angles = {
             0: 0.0,                  # 0 degrees (vertical)
-            1: np.pi/2,              # 90 degrees (horizontal)
-            2: np.pi/3,              # 60 degrees
-            3: 2*np.pi/3             # 120 degrees
+            1: np.pi/6,              # 30 degrees (horizontal)
+            2: 5*np.pi/6,              # 150 degrees
+            # 3: 2*np.pi/3             # 120 degrees
         }
         
         # Initialize u_min values for each plane
@@ -78,7 +81,18 @@ class LineIntersectionSolver:
         if device is None:
             device = self.device
         
-        return project_volume_cuda(volume, theta, u_min, device)
+        if self.debug:
+            start_time = time.time()
+            print(f"Projecting volume with shape {volume.shape} at angle theta={theta:.2f}...")
+        
+        projection = project_volume_cuda(volume, theta, u_min, device)
+        
+        if self.debug:
+            end_time = time.time()
+            print(f"  Projection complete in {end_time - start_time:.2f} seconds")
+            print(f"  Projection shape: {projection.shape}")
+        
+        return projection
     
     def backproject_plane(self, projection_data, plane_id):
         """
@@ -94,28 +108,50 @@ class LineIntersectionSolver:
         theta = self.plane_angles[plane_id]
         u_min = self.u_min_values[plane_id]
         
-        return backproject_hits_cuda(
+        if self.debug:
+            start_time = time.time()
+            print(f"Backprojecting plane {plane_id} (theta={theta:.2f})...")
+            print(f"  Projection shape: {projection_data.shape}")
+            print(f"  Non-zero hits: {torch.count_nonzero(projection_data).item()}")
+        
+        points, directions, plane_ids = backproject_hits_cuda(
             projection_data,
             theta,
             u_min,
             self.volume_shape,
             device=self.device
         )
+        
+        if self.debug:
+            end_time = time.time()
+            print(f"  Backprojection complete in {end_time - start_time:.2f} seconds")
+            print(f"  Generated {points.shape[0]} lines")
+        
+        return points, directions, plane_ids
     
-    def find_intersections(self, projections):
+    def find_intersections(self, projections, fast_merge=True):
         """
         Find intersections between backprojected lines from multiple wire planes.
         
         Args:
             projections (dict): Dictionary mapping plane_id to projection data
+            fast_merge (bool): Whether to use fast merge mode for clustering (much faster but slightly less precise)
             
         Returns:
             torch.Tensor: Intersection points (N, 3)
         """
+        if self.debug:
+            total_start_time = time.time()
+            print(f"Finding intersections between lines from {len(projections)} planes...")
+        
         # Convert projections to lines
         all_points = []
         all_directions = []
         all_plane_ids = []
+        
+        if self.debug:
+            print("Converting projections to lines...")
+            backproject_start = time.time()
         
         for plane_id, projection in projections.items():
             points, directions, plane_ids = self.backproject_plane(projection, plane_id)
@@ -128,17 +164,32 @@ class LineIntersectionSolver:
         all_directions = torch.cat(all_directions, dim=0)
         all_plane_ids = torch.cat(all_plane_ids, dim=0)
         
+        if self.debug:
+            backproject_end = time.time()
+            print(f"  Converted all projections to {all_points.shape[0]} lines in {backproject_end - backproject_start:.2f} seconds")
+        
         # Find all pairwise intersections
         intersection_points = []
         intersection_distances = []
         
+        if self.debug:
+            print("Finding pairwise intersections between planes...")
+            pairwise_start = time.time()
+        
         # Find intersections between lines from different planes
-        for i in range(len(projections)):
-            for j in range(i + 1, len(projections)):
-                # Get line parameters for each plane
-                plane_id1 = list(projections.keys())[i]
-                plane_id2 = list(projections.keys())[j]
+        num_planes = len(projections)
+        plane_ids = list(projections.keys())
+        
+        for i in range(num_planes):
+            for j in range(i + 1, num_planes):
+                plane_id1 = plane_ids[i]
+                plane_id2 = plane_ids[j]
                 
+                if self.debug:
+                    plane_pair_start = time.time()
+                    print(f"  Processing plane pair ({plane_id1}, {plane_id2})...")
+                
+                # Get line parameters for each plane
                 mask1 = all_plane_ids == plane_id1
                 mask2 = all_plane_ids == plane_id2
                 
@@ -150,18 +201,42 @@ class LineIntersectionSolver:
                 directions2 = all_directions[mask2]
                 plane_ids2 = all_plane_ids[mask2]
                 
+                if self.debug:
+                    print(f"    Plane {plane_id1}: {points1.shape[0]} lines")
+                    print(f"    Plane {plane_id2}: {points2.shape[0]} lines")
+                    print(f"    Potential pairs: {points1.shape[0] * points2.shape[0]}")
+                    intersection_find_start = time.time()
+                
                 # Find intersections
                 points, indices1, indices2, distances = find_intersections_cuda(
                     points1, directions1, plane_ids1,
                     points2, directions2, plane_ids2,
-                    self.tolerance, self.device
+                    self.tolerance, self.device, debug=self.debug
                 )
+                
+                if self.debug:
+                    intersection_find_end = time.time()
+                    print(f"    Found {points.shape[0]} intersections in {intersection_find_end - intersection_find_start:.2f} seconds")
                 
                 intersection_points.append(points)
                 intersection_distances.append(distances)
+                
+                if self.debug:
+                    plane_pair_end = time.time()
+                    print(f"  Finished plane pair in {plane_pair_end - plane_pair_start:.2f} seconds")
+        
+        if self.debug:
+            pairwise_end = time.time()
+            print(f"  Completed all pairwise intersections in {pairwise_end - pairwise_start:.2f} seconds")
         
         # Concatenate all intersection points
         if intersection_points:
+            if self.debug:
+                merge_start = time.time()
+                print(f"Merging intersection points...")
+                num_intersections = sum(p.shape[0] for p in intersection_points)
+                print(f"  Total intersections before merging: {num_intersections}")
+            
             all_intersection_points = torch.cat(intersection_points, dim=0)
             all_distances = torch.cat(intersection_distances, dim=0)
             
@@ -169,29 +244,57 @@ class LineIntersectionSolver:
             merged_points = merge_nearby_intersections_cuda(
                 all_intersection_points,
                 all_distances,
-                self.merge_tolerance
+                self.merge_tolerance,
+                debug=self.debug,
+                fast_mode=fast_merge
             )
+            
+            if self.debug:
+                merge_end = time.time()
+                print(f"  Merged {all_intersection_points.shape[0]} points into {merged_points.shape[0]} clusters")
+                print(f"  Merging completed in {merge_end - merge_start:.2f} seconds")
+                
+                total_end = time.time()
+                print(f"Total intersection finding time: {total_end - total_start_time:.2f} seconds")
             
             return merged_points
         else:
+            if self.debug:
+                print("No intersections found between any planes")
+                total_end = time.time()
+                print(f"Total intersection finding time: {total_end - total_start_time:.2f} seconds")
+            
             return torch.zeros((0, 3), device=self.device)
 
-    def solve_inverse_problem(self, projections):
+    def solve_inverse_problem(self, projections, fast_merge=True):
         """
         Solve the inverse problem: find 3D points that are consistent with
         intersections of backprojected lines from different wire planes.
         
         Args:
             projections (dict): Dictionary mapping plane_id to projection data
+            fast_merge (bool): Whether to use fast merge mode for clustering (much faster but slightly less precise)
             
         Returns:
             torch.Tensor: 3D points that are consistent with the projections
         """
+        if self.debug:
+            start_time = time.time()
+            print("Solving inverse problem...")
+            if fast_merge:
+                print("  Using FAST merge mode for maximum speed")
+            else:
+                print("  Using PRECISE merge mode (slower but more accurate)")
+        
         # Find intersections between backprojected lines
-        intersection_points = self.find_intersections(projections)
+        intersection_points = self.find_intersections(projections, fast_merge)
         
         # Filter out points outside the volume
         if intersection_points.size(0) > 0:
+            if self.debug:
+                filter_start = time.time()
+                print(f"Filtering {intersection_points.shape[0]} points to those inside the volume...")
+            
             # Convert volume bounds to tensors
             volume_min = torch.tensor(self.volume_min, device=self.device)
             volume_max = torch.tensor(self.volume_max, device=self.device)
@@ -204,8 +307,21 @@ class LineIntersectionSolver:
             # Filter points
             filtered_points = intersection_points[inside_volume]
             
+            if self.debug:
+                filter_end = time.time()
+                print(f"  Filtered to {filtered_points.shape[0]} points inside the volume")
+                print(f"  Filtering completed in {filter_end - filter_start:.2f} seconds")
+                
+                end_time = time.time()
+                print(f"Inverse problem solved in {end_time - start_time:.2f} seconds")
+            
             return filtered_points
         else:
+            if self.debug:
+                end_time = time.time()
+                print("No intersection points found")
+                print(f"Inverse problem solved in {end_time - start_time:.2f} seconds")
+            
             return intersection_points
     
     def lines_from_numpy_array(self, array, plane_id):

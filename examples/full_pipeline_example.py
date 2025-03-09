@@ -17,9 +17,94 @@ from lartpc_reconstruction import (
     visualize_original_vs_reconstructed
 )
 
+def create_sparse_synthetic_volume(size=100, num_points=5, point_size=3.0, device='cuda'):
+    """
+    Create a synthetic 3D volume with randomly placed points, using a sparse approach.
+    
+    Args:
+        size (int): Size of the volume (size x size x size)
+        num_points (int): Number of random points to generate
+        point_size (float): Size of the points (standard deviation of Gaussian)
+        device (str): Device to use ('cuda' or 'cpu')
+        
+    Returns:
+        tuple: (sparse_volume, points) - The sparse volume representation and the original 3D points
+               sparse_volume is a tuple of (coords, values, shape)
+    """
+    # Generate random 3D points
+    points = torch.randint(
+        int(point_size * 3), 
+        size - int(point_size * 3), 
+        (num_points, 3),
+        device=device
+    ).float()
+    
+    # Preallocate the coords and values lists for non-zero voxels
+    max_voxels = num_points * int((6*point_size)**3)  # Conservative upper bound
+    coords_list = []
+    values_list = []
+    
+    # Create point clouds around each point
+    for point in points:
+        x, y, z = point.long()
+        # Calculate the ranges for the Gaussian blob
+        x_range = torch.arange(max(0, x - int(3*point_size)), min(size, x + int(3*point_size) + 1), device=device)
+        y_range = torch.arange(max(0, y - int(3*point_size)), min(size, y + int(3*point_size) + 1), device=device)
+        z_range = torch.arange(max(0, z - int(3*point_size)), min(size, z + int(3*point_size) + 1), device=device)
+        
+        # Create meshgrid for the blob
+        xx, yy, zz = torch.meshgrid(x_range, y_range, z_range, indexing='ij')
+        
+        # Calculate distances
+        distances = torch.sqrt((xx - x.float())**2 + (yy - y.float())**2 + (zz - z.float())**2)
+        
+        # Calculate values with Gaussian
+        values = torch.exp(-(distances/point_size)**2 / 2)
+        
+        # Filter out low values for sparsity
+        mask = values > 0.01
+        if mask.sum() > 0:
+            # Get coordinates and values for this point's blob
+            point_coords = torch.stack([xx[mask], yy[mask], zz[mask]], dim=1)
+            point_values = values[mask]
+            
+            coords_list.append(point_coords)
+            values_list.append(point_values)
+    
+    # Combine all points
+    if coords_list:
+        all_coords = torch.cat(coords_list, dim=0)
+        all_values = torch.cat(values_list, dim=0)
+        
+        # Handle duplicate coordinates by taking max value
+        # First, create a unique identifier for each coordinate
+        coord_ids = all_coords[:, 0] * size**2 + all_coords[:, 1] * size + all_coords[:, 2]
+        
+        # Find unique coordinates and their indices
+        unique_ids, inverse_indices = torch.unique(coord_ids, return_inverse=True)
+        
+        # Create new coordinates and values arrays
+        unique_coords = torch.zeros((len(unique_ids), 3), dtype=torch.long, device=device)
+        unique_values = torch.zeros(len(unique_ids), device=device)
+        
+        # For each unique coordinate, find all points with that coordinate
+        # and take the maximum value
+        for i, unique_id in enumerate(unique_ids):
+            mask = (coord_ids == unique_id)
+            unique_coords[i] = all_coords[mask][0]  # All coords with this ID are the same
+            unique_values[i] = torch.max(all_values[mask])
+    else:
+        # Handle case with no points (unlikely but possible)
+        unique_coords = torch.zeros((0, 3), dtype=torch.long, device=device)
+        unique_values = torch.zeros(0, device=device)
+    
+    return (unique_coords, unique_values, (size, size, size)), points
+
 def create_synthetic_volume(size=100, num_points=5, point_size=3.0, device='cuda'):
     """
     Create a synthetic 3D volume with randomly placed points.
+    Now using the sparse implementation internally for efficiency,
+    but still returns a dense volume for compatibility.
     
     Args:
         size (int): Size of the volume (size x size x size)
@@ -30,29 +115,14 @@ def create_synthetic_volume(size=100, num_points=5, point_size=3.0, device='cuda
     Returns:
         tuple: (volume, points) - The volume tensor and the original 3D points
     """
-    # Create an empty volume
-    volume = torch.zeros((size, size, size), device=device)
+    # Create sparse volume
+    sparse_volume, points = create_sparse_synthetic_volume(size, num_points, point_size, device)
+    coords, values, shape = sparse_volume
     
-    # Generate random 3D points
-    points = torch.randint(
-        int(point_size * 3), 
-        size - int(point_size * 3), 
-        (num_points, 3),
-        device=device
-    ).float()
-    
-    # Place points in the volume
-    for point in points:
-        x, y, z = point.long()
-        # Create a Gaussian blob at each point
-        for dx in range(-int(3*point_size), int(3*point_size) + 1):
-            for dy in range(-int(3*point_size), int(3*point_size) + 1):
-                for dz in range(-int(3*point_size), int(3*point_size) + 1):
-                    nx, ny, nz = x + dx, y + dy, z + dz
-                    if 0 <= nx < size and 0 <= ny < size and 0 <= nz < size:
-                        dist = torch.sqrt(torch.tensor(dx**2 + dy**2 + dz**2, device=device))
-                        value = torch.exp(-(dist/point_size)**2 / 2)
-                        volume[nx, ny, nz] = max(volume[nx, ny, nz], value)
+    # Convert to dense volume
+    volume = torch.zeros(shape, device=device)
+    if coords.shape[0] > 0:
+        volume[coords[:, 0], coords[:, 1], coords[:, 2]] = values
     
     return volume, points
 
@@ -94,9 +164,13 @@ def create_synthetic_lines(points, angles, noise=1.0, device='cuda'):
     
     return lines_by_plane
 
-def run_full_pipeline():
+def run_full_pipeline(debug=True, fast_merge=True):
     """
     Run the full pipeline from creating a synthetic volume to reconstruction and evaluation.
+    
+    Args:
+        debug (bool): Whether to print detailed debug information
+        fast_merge (bool): Whether to use fast merging mode for intersection clustering
     """
     print("=== Running full pipeline example ===")
     
@@ -111,20 +185,32 @@ def run_full_pipeline():
     tolerance = 2.0
     merge_tolerance = 3.0
     
-    # 1. Create a synthetic volume
+    # 1. Create a synthetic volume (using the sparse approach internally)
     print("\n1. Creating synthetic volume...")
     start_time = time()
-    volume, original_points = create_synthetic_volume(
+    
+    # Use sparse representation for efficiency
+    sparse_volume, original_points = create_sparse_synthetic_volume(
         size=volume_size,
         num_points=num_points,
         point_size=point_size,
         device=device
     )
-    print(f"Created volume with {num_points} points in {time() - start_time:.2f} seconds")
+    
+    # For visualization, create a dense volume only when needed
+    coords, values, shape = sparse_volume
+    
+    print(f"Created sparse volume with {coords.shape[0]} non-zero voxels in {time() - start_time:.2f} seconds")
     print(f"Original points:\n{original_points.cpu().numpy()}")
     
+    # Convert to dense for visualization only
+    print("Converting to dense for visualization...")
+    dense_volume = torch.zeros(shape, device=device)
+    if coords.shape[0] > 0:
+        dense_volume[coords[:, 0], coords[:, 1], coords[:, 2]] = values
+    
     # Visualize the volume
-    fig = visualize_volume(volume)
+    fig = visualize_volume(dense_volume)
     fig.savefig('original_volume.png')
     plt.close(fig)
     
@@ -134,13 +220,17 @@ def run_full_pipeline():
         volume_shape=(volume_size, volume_size, volume_size),
         tolerance=tolerance,
         merge_tolerance=merge_tolerance,
-        device=device
+        device=device,
+        debug=debug
     )
     
     # 3. Project the volume to 2D projections
     print("\n3. Projecting volume to 2D...")
     start_time = time()
-    projections = reconstructor.project_volume(volume)
+    
+    # Use sparse representation for projection
+    projections = reconstructor.project_volume(sparse_volume)
+    
     print(f"Projected volume in {time() - start_time:.2f} seconds")
     
     # Visualize the projections
@@ -151,7 +241,7 @@ def run_full_pipeline():
     # 4. Reconstruct 3D points from projections
     print("\n4. Reconstructing 3D points from projections...")
     start_time = time()
-    reconstructed_points = reconstructor.reconstruct_from_projections(projections, threshold=0.1)
+    reconstructed_points = reconstructor.reconstruct_from_projections(projections, threshold=0.1, fast_merge=fast_merge)
     print(f"Reconstructed {reconstructed_points.size(0)} points in {time() - start_time:.2f} seconds")
     print(f"Reconstructed points:\n{reconstructed_points.cpu().numpy()}")
     
@@ -164,10 +254,19 @@ def run_full_pipeline():
     fig.savefig('original_vs_reconstructed.png')
     plt.close(fig)
     
-    # 5. Reconstruct 3D volume from projections
+    # 5. Reconstruct 3D volume from projections (use sparse reconstruction for efficiency)
     print("\n5. Reconstructing 3D volume from projections...")
     start_time = time()
-    reconstructed_volume = reconstructor.reconstruct_volume(projections, threshold=0.1, voxel_size=1.0)
+    
+    # Use sparse reconstruction
+    reconstructed_sparse_volume = reconstructor.reconstruct_sparse_volume(projections, threshold=0.1, voxel_size=1.0, fast_merge=fast_merge)
+    reconstructed_coords, reconstructed_values, _ = reconstructed_sparse_volume
+    
+    # Convert to dense for visualization
+    reconstructed_volume = torch.zeros(shape, device=device)
+    if reconstructed_coords.shape[0] > 0:
+        reconstructed_volume[reconstructed_coords[:, 0], reconstructed_coords[:, 1], reconstructed_coords[:, 2]] = reconstructed_values
+    
     print(f"Reconstructed volume in {time() - start_time:.2f} seconds")
     
     # Visualize the reconstructed volume
@@ -177,7 +276,7 @@ def run_full_pipeline():
     
     # 6. Evaluate the reconstruction
     print("\n6. Evaluating reconstruction...")
-    metrics = reconstructor.evaluate_reconstruction(volume, reconstructed_volume, threshold=0.1)
+    metrics = reconstructor.evaluate_reconstruction(dense_volume, reconstructed_volume, threshold=0.1)
     print("Evaluation metrics:")
     for metric, value in metrics.items():
         print(f"  {metric}: {value:.4f}")
@@ -215,4 +314,8 @@ def run_full_pipeline():
     print("  - lines_and_intersections.png")
 
 if __name__ == "__main__":
-    run_full_pipeline() 
+    # Set to True for detailed debug output, False for concise output
+    debug_mode = True
+    # Set to True for maximum speed, False for maximum precision
+    fast_merge_mode = True
+    run_full_pipeline(debug=debug_mode, fast_merge=fast_merge_mode) 

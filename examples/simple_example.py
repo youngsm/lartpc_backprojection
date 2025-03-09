@@ -243,7 +243,7 @@ def visualize_results(original_points, reconstructed_points, volume_size):
     ax.legend()
     
     plt.tight_layout()
-    plt.show()
+    plt.savefig('img/original_vs_reconstructed.png')
 
 if __name__ == "__main__":
     # Choose which example to run
