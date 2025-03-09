@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as colors
+from matplotlib.colors import LogNorm
 from mpl_toolkits.mplot3d import Axes3D
 import torch
 
@@ -52,7 +53,7 @@ def visualize_volume(volume, threshold=0.1, alpha=0.5, figsize=(10, 8)):
     
     return fig
 
-def visualize_projections(projections, figsize=(15, 5)):
+def visualize_projections(projections, figsize=(15, 5), lognorm=False):
     """
     Visualize 2D projections from different wire planes.
     
@@ -85,7 +86,7 @@ def visualize_projections(projections, figsize=(15, 5)):
         angle = angle_labels.get(plane_id, f'Plane {plane_id}')
         
         # Plot projection
-        im = axes[i].imshow(proj.T, aspect='auto', origin='lower', cmap='viridis', interpolation='none')
+        im = axes[i].imshow(proj.T, aspect='auto', origin='lower', cmap='viridis', interpolation='none', norm=LogNorm() if lognorm else None)
         axes[i].set_title(f'Projection ({angle})')
         axes[i].set_xlabel('X (drift)')
         axes[i].set_ylabel('U (wire)')

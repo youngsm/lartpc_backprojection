@@ -685,7 +685,7 @@ def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="c
     return points, directions, plane_ids
 
 
-def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, device='cuda'):
+def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None):
     """
     Project a sparse 3D volume to a 2D projection using CUDA.
     Much more efficient for sparse volumes.
@@ -697,11 +697,15 @@ def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, devic
         theta (float): Angle of the wire plane in radians
         u_min (float): Minimum u-coordinate
         device (str): Device to use ('cuda' or 'cpu')
+        projection_size (tuple): Optional. Size of the output projection (depth, width). 
+                                If None, the size is determined dynamically.
         
     Returns:
-        torch.Tensor: 2D projection of shape (depth, U) where U depends on the projection
+        torch.Tensor: 2D projection of shape (depth, U) where U depends on the projection or projection_size
     """
     if coords.shape[0] == 0:  # Empty volume
+        if projection_size is not None:
+            return torch.zeros(projection_size, device=device)
         return torch.zeros((volume_shape[0], 1), device=device)
     
     # Get volume shape
@@ -719,7 +723,12 @@ def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, devic
     u = u.long()
     
     # Determine the size of the projection
-    u_max = int(torch.max(u).item()) + 1
+    if projection_size is not None:
+        # Use standardized size
+        _, u_max = projection_size
+    else:
+        # Use dynamic size based on points
+        u_max = int(torch.max(u).item()) + 1
     
     # Create 2D indices for the sparse tensor
     indices = torch.stack([x, u], dim=0)
@@ -738,7 +747,7 @@ def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, devic
     return projection
 
 
-def project_volume_cuda(volume, theta, u_min, device='cuda'):
+def project_volume_cuda(volume, theta, u_min, device='cuda', projection_size=None):
     """
     Project a 3D volume to a 2D projection using CUDA.
     Automatically uses sparse implementation for efficiency if volume is sparse.
@@ -748,9 +757,11 @@ def project_volume_cuda(volume, theta, u_min, device='cuda'):
         theta (float): Angle of the wire plane in radians
         u_min (float): Minimum u-coordinate
         device (str): Device to use ('cuda' or 'cpu')
+        projection_size (tuple): Optional. Size of the output projection (depth, width).
+                                If None, the size is determined dynamically.
         
     Returns:
-        torch.Tensor: 2D projection of shape (N, U) where U depends on the projection
+        torch.Tensor: 2D projection of shape (N, U) where U depends on the projection or projection_size
     """
     # If the volume is sparse (less than 1% non-zero), use sparse implementation
     sparsity = (volume > 0).sum() / volume.numel()
@@ -761,7 +772,7 @@ def project_volume_cuda(volume, theta, u_min, device='cuda'):
         non_zero_values = volume[non_zero_indices[:, 0], non_zero_indices[:, 1], non_zero_indices[:, 2]]
         
         # Use sparse projection
-        return project_volume_cuda_sparse(non_zero_indices, non_zero_values, volume.shape, theta, u_min, device)
+        return project_volume_cuda_sparse(non_zero_indices, non_zero_values, volume.shape, theta, u_min, device, projection_size)
     
     # For denser volumes, use the original approach but more efficiently
     # Get volume shape
@@ -781,7 +792,12 @@ def project_volume_cuda(volume, theta, u_min, device='cuda'):
     u_indices = u_indices.long()
     
     # Determine the size of the projection
-    u_max = int(torch.max(u_indices).item()) + 1
+    if projection_size is not None:
+        # Use standardized size
+        _, u_max = projection_size
+    else:
+        # Use dynamic size based on points
+        u_max = int(torch.max(u_indices).item()) + 1
     
     # Create the projection tensor
     projection = torch.zeros((N, u_max), device=device)
@@ -791,5 +807,182 @@ def project_volume_cuda(volume, theta, u_min, device='cuda'):
         x_idx = x_indices[i]
         u_idx = u_indices[i]
         projection[x_idx, u_idx] += values[i]
+    
+    return projection
+
+
+def project_volume_differentiable(volume, theta, u_min, device='cuda', projection_size=None):
+    """
+    Differentiable version of the volume projection operation.
+    Maintains gradients throughout the projection for backpropagation.
+    
+    Args:
+        volume (torch.Tensor): 3D volume of shape (N, N, N)
+        theta (float): Angle of the wire plane in radians
+        u_min (float): Minimum u-coordinate
+        device (str): Device to use ('cuda' or 'cpu')
+        projection_size (tuple): Optional. Size of the output projection (depth, width).
+                                If None, the size is determined dynamically.
+        
+    Returns:
+        torch.Tensor: 2D projection of shape (N, U) where U depends on the projection or projection_size
+    """
+    # Optimize by converting to sparse if the volume is sparse enough
+    sparsity = torch.count_nonzero(volume) / volume.numel()
+    if sparsity < 0.1:  # If less than 10% of voxels are non-zero, use sparse version
+        # Convert to sparse representation
+        coords = torch.nonzero(volume, as_tuple=False)
+        values = volume[coords[:, 0], coords[:, 1], coords[:, 2]]
+        return project_sparse_volume_differentiable(coords, values, volume.shape, theta, u_min, device, projection_size)
+    
+    # Get volume shape
+    N = volume.shape[0]
+    
+    # For non-sparse volumes, use a more memory-efficient approach
+    # We'll process the volume plane by plane to reduce memory usage
+    
+    # Create a tensor for the output projection
+    if projection_size is not None:
+        _, u_max = projection_size
+    else:
+        # Calculate maximum possible u value
+        max_y = N - 1
+        max_z = N - 1
+        sin_theta = torch.sin(torch.tensor(theta, device=device))
+        cos_theta = torch.cos(torch.tensor(theta, device=device))
+        max_u = -sin_theta * max_y + cos_theta * max_z - u_min
+        u_max = int(torch.ceil(max_u.item())) + 2
+    
+    projection = torch.zeros((N, u_max), device=device)
+    
+    # We'll process one x-slice at a time to save memory
+    for x in range(N):
+        # Get the x-slice of the volume
+        slice_2d = volume[x]
+        
+        # Skip if the entire slice is zeros
+        if not torch.any(slice_2d):
+            continue
+        
+        # Find non-zero positions in the slice
+        y_indices, z_indices = torch.nonzero(slice_2d, as_tuple=True)
+        values = slice_2d[y_indices, z_indices]
+        
+        # Convert to float for accurate calculations
+        y = y_indices.float()
+        z = z_indices.float()
+        
+        # Calculate u coordinates (without rounding for differentiability)
+        sin_theta = torch.sin(torch.tensor(theta, device=device))
+        cos_theta = torch.cos(torch.tensor(theta, device=device))
+        u_coords = -sin_theta * y + cos_theta * z - u_min
+        
+        # Calculate indices and fractions for bilinear interpolation
+        u_indices = torch.clamp(torch.floor(u_coords).long(), min=0, max=u_max-1)
+        u_frac = u_coords - u_indices.float()
+        u_indices_next = torch.clamp(u_indices + 1, max=u_max-1)
+        
+        # Calculate weights for bilinear interpolation
+        weight_current = (1.0 - u_frac) * values
+        weight_next = u_frac * values
+        
+        # Use sparse tensor operations for speed
+        indices_current = torch.stack([torch.zeros_like(u_indices) + x, u_indices], dim=1)
+        indices_next = torch.stack([torch.zeros_like(u_indices_next) + x, u_indices_next], dim=1)
+        
+        # Create and add sparse tensors
+        current_contribution = torch.sparse_coo_tensor(
+            indices=indices_current.t(),
+            values=weight_current,
+            size=(N, u_max),
+            device=device
+        )
+        
+        next_contribution = torch.sparse_coo_tensor(
+            indices=indices_next.t(),
+            values=weight_next,
+            size=(N, u_max),
+            device=device
+        )
+        
+        # Add to the projection
+        projection += current_contribution.to_dense()
+        projection += next_contribution.to_dense()
+    
+    return projection
+
+
+def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None):
+    """
+    Differentiable projection of a sparse volume to a 2D plane.
+    Optimized for coalesced memory access.
+    
+    Args:
+        coords (torch.Tensor): Coordinates of non-zero voxels (N, 3)
+        values (torch.Tensor): Values of non-zero voxels (N)
+        volume_shape (tuple): Shape of the volume (x_size, y_size, z_size)
+        theta (float): Projection angle in radians
+        u_min (float): Minimum u-coordinate
+        device (str): Device to use for computation
+        projection_size (tuple, optional): Size of the projection (x_size, u_size)
+        
+    Returns:
+        torch.Tensor: Projection of shape (x_size, u_size)
+    """
+    # Sort coordinates for better memory access patterns
+    # Sort by x coordinate first, which will improve cache locality
+    sorted_indices = torch.argsort(coords[:, 0])
+    sorted_coords = coords[sorted_indices]
+    sorted_values = values[sorted_indices]
+    
+    # Determine projection dimensions
+    x_size = volume_shape[0]
+    
+    if projection_size is None:
+        # Automatically determine projection size
+        # Maximum u can be calculated from the volume dimensions and angle
+        max_y = volume_shape[1] - 1
+        max_z = volume_shape[2] - 1
+        
+        # Calculate max u value (account for projection angle)
+        sin_theta = torch.sin(torch.tensor(theta, device=device))
+        cos_theta = torch.cos(torch.tensor(theta, device=device))
+        u_max = max_y * cos_theta + max_z * sin_theta
+        
+        # Projection size is (x_size, u_size)
+        u_size = int(torch.ceil(u_max - u_min).item()) + 1
+        projection_size = (x_size, u_size)
+    else:
+        x_size, u_size = projection_size
+    
+    # Get needed trig values
+    sin_theta = torch.sin(torch.tensor(theta, device=device))
+    cos_theta = torch.cos(torch.tensor(theta, device=device))
+    
+    # Calculate u coordinates for each point
+    u_coords = sorted_coords[:, 1] * cos_theta + sorted_coords[:, 2] * sin_theta - u_min
+    
+    # Round to get integer indices for u
+    u_indices = torch.clamp(torch.round(u_coords).long(), 0, u_size - 1)
+    
+    # Get x indices
+    x_indices = sorted_coords[:, 0]
+    
+    # Filter out indices that would be outside the projection
+    valid_mask = (x_indices >= 0) & (x_indices < x_size)
+    x_indices = x_indices[valid_mask]
+    u_indices = u_indices[valid_mask]
+    point_values = sorted_values[valid_mask]
+    
+    # Create 2D indices for scatter operation
+    indices = torch.stack([x_indices, u_indices], dim=0)
+    
+    # Create a sparse tensor with contributions, then densify it
+    projection = torch.sparse_coo_tensor(
+        indices, 
+        point_values,
+        size=(x_size, u_size),
+        device=device
+    ).to_dense()
     
     return projection

@@ -55,6 +55,9 @@ class LineIntersectionSolver:
         # These ensure nonnegative indices in the projections
         self.u_min_values = {}
         self._compute_u_min_values()
+        
+        # Calculate maximum u-coordinate for each plane to standardize projection sizes
+        self._compute_projection_dimensions()
     
     def _compute_u_min_values(self):
         """
@@ -80,22 +83,62 @@ class LineIntersectionSolver:
             # Set u_min to ensure nonnegative indices
             self.u_min_values[plane_id] = np.floor(min(u_values))
     
+    def _compute_projection_dimensions(self):
+        """
+        Compute standardized projection dimensions for each plane based on volume shape and wire orientation.
+        This ensures that all projections have consistent sizes for direct comparison.
+        """
+        self.projection_sizes = {}
+        
+        # Get volume dimensions
+        N = self.volume_shape[0]
+        
+        for plane_id, theta in self.plane_angles.items():
+            # Calculate u-coordinates for the volume corners
+            sin_theta = np.sin(theta)
+            cos_theta = np.cos(theta)
+            
+            # Calculate u-coordinate for the four corners of the (y,z) plane
+            corners = [
+                (-sin_theta * 0 + cos_theta * 0),             # (0,0)
+                (-sin_theta * (N-1) + cos_theta * 0),         # (N-1,0)
+                (-sin_theta * 0 + cos_theta * (N-1)),         # (0,N-1)
+                (-sin_theta * (N-1) + cos_theta * (N-1))      # (N-1,N-1)
+            ]
+            
+            # Find the min and max u-coordinates
+            min_u = min(corners)
+            max_u = max(corners)
+            
+            # Adjust by u_min to get the actual projection range
+            u_min = self.u_min_values[plane_id]
+            min_u_adj = min_u - u_min
+            max_u_adj = max_u - u_min
+            
+            # Calculate the standard projection size (x dimension is always the volume size)
+            # Add buffer to ensure we have enough space for all points
+            projection_width = int(np.ceil(max_u_adj)) + 2  # Add buffer of 2
+            
+            self.projection_sizes[plane_id] = (N, projection_width)
+            
+            if self.debug:
+                print(f"Plane {plane_id}: theta={theta:.2f}, projection size={self.projection_sizes[plane_id]}")
+                print(f"  u range: [{min_u_adj:.2f}, {max_u_adj:.2f}]")
+    
     def set_plane_angles(self, plane_angles):
         """
-        Update the plane angles used for projection and backprojection.
+        Set wire plane angles.
         
         Args:
-            plane_angles (dict): Dictionary mapping plane_id to angle in radians
+            plane_angles (dict): Dictionary mapping plane_id to wire plane angle in radians
         """
         self.plane_angles = plane_angles
-        self._compute_u_min_values()
         
-        if self.debug:
-            print("Updated plane angles:")
-            for plane_id, angle in self.plane_angles.items():
-                print(f"  Plane {plane_id}: {angle:.2f} radians ({angle * 180 / np.pi:.1f}°)")
+        # Recompute u_min values and projection dimensions when angles change
+        self._compute_u_min_values()
+        self._compute_projection_dimensions()
     
-    def project_volume_cuda(self, volume, theta, u_min, device=None):
+    def project_volume_cuda(self, volume, theta, u_min, device=None, projection_size=None):
         """
         Project a 3D volume to a 2D projection using CUDA.
         
@@ -103,26 +146,33 @@ class LineIntersectionSolver:
             volume (torch.Tensor): 3D volume of shape (N, N, N)
             theta (float): Angle of the wire plane in radians
             u_min (float): Minimum u-coordinate
-            device (str, optional): Device to use ('cuda' or 'cpu'). If None, use the solver's device.
+            device (str): Device to use ('cuda' or 'cpu')
+            projection_size (tuple): Optional. Size of the output projection (depth, width).
+                                   If None, it will be determined from plane angles.
             
         Returns:
-            torch.Tensor: 2D projection of shape (N, U) where U depends on the projection
+            torch.Tensor: 2D projection of shape (N, U)
         """
         if device is None:
             device = self.device
         
-        if self.debug:
-            start_time = time.time()
-            print(f"Projecting volume with shape {volume.shape} at angle theta={theta:.2f}...")
+        # Find the plane ID for this theta value to get the standardized projection size
+        plane_id = None
+        for pid, angle in self.plane_angles.items():
+            if abs(angle - theta) < 1e-6:  # Close enough to be considered the same angle
+                plane_id = pid
+                break
         
-        projection = project_volume_cuda(volume, theta, u_min, device)
+        # Get the standardized projection size if we found a matching plane ID and it's not already provided
+        if projection_size is None:
+            if plane_id is not None and hasattr(self, 'projection_sizes'):
+                projection_size = self.projection_sizes[plane_id]
         
-        if self.debug:
-            end_time = time.time()
-            print(f"  Projection complete in {end_time - start_time:.2f} seconds")
-            print(f"  Projection shape: {projection.shape}")
+        # Import the CUDA projection function
+        from .cuda_kernels import project_volume_cuda as project_volume_cuda_func
         
-        return projection
+        # Project the volume
+        return project_volume_cuda_func(volume, theta, u_min, device, projection_size=projection_size)
     
     def backproject_plane(self, projection_data, plane_id):
         """

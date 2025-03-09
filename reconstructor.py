@@ -3,6 +3,7 @@ import numpy as np
 import time
 import math
 from .intersection_solver import LineIntersectionSolver
+from tqdm import trange
 
 class LArTPCReconstructor:
     """
@@ -80,7 +81,19 @@ class LArTPCReconstructor:
             result = {}
             for plane_id, theta in self.solver.plane_angles.items():
                 u_min = self.solver.u_min_values[plane_id]
-                result[plane_id] = self.solver.project_volume_cuda(volume, theta, u_min)
+                projection_size = self.solver.projection_sizes[plane_id]
+                
+                if self.debug:
+                    print(f"  Projecting to plane {plane_id} with standardized size {projection_size}")
+                
+                # Call the project_volume_cuda method with the right arguments
+                result[plane_id] = self.solver.project_volume_cuda(
+                    volume=volume, 
+                    theta=theta, 
+                    u_min=u_min,
+                    device=self.device,
+                    projection_size=projection_size
+                )
         
         if self.debug:
             end_time = time.time()
@@ -118,10 +131,12 @@ class LArTPCReconstructor:
                 print(f"  Projecting to plane {plane_id} (theta={theta:.2f})...")
                 
             u_min = self.solver.u_min_values[plane_id]
+            projection_size = self.solver.projection_sizes[plane_id]
             
             # Use sparse projection directly
             from .cuda_kernels import project_volume_cuda_sparse
-            projection = project_volume_cuda_sparse(coords, values, shape, theta, u_min, self.device)
+            projection = project_volume_cuda_sparse(coords, values, shape, theta, u_min, 
+                                                  self.device, projection_size=projection_size)
             projections[plane_id] = projection
             
             if self.debug:
@@ -133,6 +148,103 @@ class LArTPCReconstructor:
         if self.debug:
             end_time = time.time()
             print(f"All sparse projections completed in {end_time - start_time:.2f} seconds")
+        
+        return projections
+    
+    def project_volume_differentiable(self, volume):
+        """
+        Differentiable version of volume projection that maintains gradients
+        for backpropagation through the entire operation.
+        
+        Args:
+            volume (torch.Tensor or tuple): 3D volume of shape (N, N, N) or a sparse volume representation
+                                           as (coords, values, shape)
+            
+        Returns:
+            dict: Dictionary mapping plane_id to projection data with gradient tracking
+        """
+        if self.debug:
+            start_time = time.time()
+            if isinstance(volume, tuple) and len(volume) == 3:
+                coords, values, shape = volume
+                print(f"Differentiable projection of sparse volume with {coords.shape[0]} non-zero voxels...")
+            else:
+                print(f"Differentiable projection of dense volume with shape {volume.shape}...")
+        
+        # Check if volume is a sparse representation
+        if isinstance(volume, tuple) and len(volume) == 3:
+            result = self.project_sparse_volume_differentiable(volume)
+        else:
+            # Move volume to the device if needed
+            if volume.device.type != self.device:
+                volume = volume.to(self.device)
+            
+            # Project volume for each plane using differentiable projection
+            result = {}
+            from .cuda_kernels import project_volume_differentiable
+            
+            for plane_id, theta in self.solver.plane_angles.items():
+                u_min = self.solver.u_min_values[plane_id]
+                projection_size = self.solver.projection_sizes[plane_id]
+                
+                result[plane_id] = project_volume_differentiable(volume, theta, u_min, 
+                                                               self.device, projection_size=projection_size)
+        
+        if self.debug:
+            end_time = time.time()
+            print(f"Differentiable projection to {len(result)} planes completed in {end_time - start_time:.2f} seconds")
+        
+        return result
+    
+    def project_sparse_volume_differentiable(self, sparse_volume):
+        """
+        Differentiable version of sparse volume projection that maintains gradients
+        for backpropagation through the entire operation.
+        
+        Args:
+            sparse_volume (tuple): Sparse volume representation as (coords, values, shape)
+            
+        Returns:
+            dict: Dictionary mapping plane_id to projection data with gradient tracking
+        """
+        coords, values, shape = sparse_volume
+        
+        if self.debug:
+            start_time = time.time()
+            print(f"Differentiable projection of sparse volume from {coords.shape[0]} non-zero voxels...")
+        
+        # Move to the device if needed
+        if coords.device.type != self.device:
+            coords = coords.to(self.device)
+        if values.device.type != self.device:
+            values = values.to(self.device)
+        
+        # Project volume for each plane
+        projections = {}
+        from .cuda_kernels import project_sparse_volume_differentiable
+        
+        for plane_id, theta in self.solver.plane_angles.items():
+            if self.debug:
+                plane_start = time.time()
+                print(f"  Projecting to plane {plane_id} (theta={theta:.2f}) with gradient tracking...")
+                
+            u_min = self.solver.u_min_values[plane_id]
+            projection_size = self.solver.projection_sizes[plane_id]
+            
+            # Use differentiable sparse projection
+            projection = project_sparse_volume_differentiable(coords, values, shape, theta, u_min, 
+                                                            self.device, projection_size=projection_size)
+            projections[plane_id] = projection
+            
+            if self.debug:
+                plane_end = time.time()
+                print(f"    Projection shape: {projection.shape}")
+                print(f"    Non-zero elements: {torch.count_nonzero(projection).item()}")
+                print(f"    Completed in {plane_end - plane_start:.2f} seconds")
+        
+        if self.debug:
+            end_time = time.time()
+            print(f"All differentiable sparse projections completed in {end_time - start_time:.2f} seconds")
         
         return projections
     
@@ -330,7 +442,7 @@ class LArTPCReconstructor:
         
         return volume
     
-    def reconstruct_sparse_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True, use_gaussian=True, snap_to_grid=True):
+    def reconstruct_sparse_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True, use_gaussian=False, snap_to_grid=True):
         """
         Reconstruct a sparse 3D volume from 2D projections by placing voxels at intersection points.
         Uses vectorized operations for better performance.
@@ -409,19 +521,24 @@ class LArTPCReconstructor:
             unique_ids, inverse_indices = torch.unique(voxel_ids, return_inverse=True)
             
             # Create sparse volume representation
-            unique_coords = torch.zeros((len(unique_ids), 3), dtype=torch.long, device=self.device)
             unique_values = torch.ones(len(unique_ids), device=self.device)  # All voxels have value 1.0
             
-            # Get coordinates for each unique voxel
-            for i, voxel_id in enumerate(unique_ids):
-                mask = (voxel_ids == voxel_id)
-                unique_coords[i] = indices[mask][0]  # Take first occurrence
+            # VECTORIZED APPROACH - Find the first occurrence of each unique ID
+            # Create a tensor marking the first occurrence of each unique value
+            first_occurrence = torch.zeros_like(voxel_ids, dtype=torch.bool)
+            first_occurrence[torch.unique(inverse_indices, return_inverse=True)[1]] = True
+            
+            # Extract coordinates of the first occurrences
+            unique_coords = indices[first_occurrence]
             
             if self.debug:
                 end_time = time.time()
                 print(f"  Created sparse volume with {len(unique_ids)} voxels in {end_time - points_time:.2f} seconds")
             
             return (unique_coords, unique_values, self.volume_shape)
+        
+
+        # If use_gaussian, the following (slow) code will be used
         
         # Parameters for Gaussian blobs
         sigma = max(1.0, voxel_size)
@@ -560,53 +677,193 @@ class LArTPCReconstructor:
     
     def evaluate_reconstruction(self, original_volume, reconstructed_volume, threshold=0.1):
         """
-        Evaluate the quality of a reconstruction by comparing it to the original volume.
+        Evaluate reconstruction quality by comparing the original and reconstructed volumes.
         
         Args:
             original_volume (torch.Tensor): Original 3D volume
             reconstructed_volume (torch.Tensor): Reconstructed 3D volume
-            threshold (float): Threshold for considering a voxel as occupied
+            threshold (float): Threshold for binarizing volumes
             
         Returns:
-            dict: Dictionary with evaluation metrics
+            dict: Dictionary of evaluation metrics
         """
-        # Move volumes to the device if needed
+        if self.debug:
+            print(f"Evaluating reconstruction quality...")
+        
+        # Ensure volumes are on the same device
         if original_volume.device.type != self.device:
             original_volume = original_volume.to(self.device)
         if reconstructed_volume.device.type != self.device:
             reconstructed_volume = reconstructed_volume.to(self.device)
         
-        # Create binary volumes
-        original_binary = original_volume > threshold
-        reconstructed_binary = reconstructed_volume > threshold
+        # Apply threshold to create binary volumes
+        original_binary = (original_volume > threshold).float()
+        reconstructed_binary = (reconstructed_volume > threshold).float()
         
-        # Compute intersection
-        intersection = torch.logical_and(original_binary, reconstructed_binary)
+        # Calculate metrics
+        intersection = torch.sum(original_binary * reconstructed_binary).item()
+        union = torch.sum(torch.clamp(original_binary + reconstructed_binary, 0, 1)).item()
         
-        # Compute union
-        union = torch.logical_or(original_binary, reconstructed_binary)
+        # IoU (Intersection over Union)
+        iou = intersection / max(1e-8, union)
         
-        # Compute metrics
-        num_original = torch.sum(original_binary).item()
-        num_reconstructed = torch.sum(reconstructed_binary).item()
-        num_intersection = torch.sum(intersection).item()
-        num_union = torch.sum(union).item()
+        # Dice coefficient
+        dice = 2 * intersection / max(1e-8, torch.sum(original_binary).item() + torch.sum(reconstructed_binary).item())
         
-        # Compute precision, recall, and IoU
-        precision = num_intersection / max(1, num_reconstructed)
-        recall = num_intersection / max(1, num_original)
-        iou = num_intersection / max(1, num_union)
-        f1 = 2 * precision * recall / max(1e-10, precision + recall)
+        # Precision and recall
+        precision = intersection / max(1e-8, torch.sum(reconstructed_binary).item())
+        recall = intersection / max(1e-8, torch.sum(original_binary).item())
         
-        return {
+        # F1 score
+        f1 = 2 * precision * recall / max(1e-8, precision + recall)
+        
+        # MSE
+        mse = torch.mean((original_volume - reconstructed_volume) ** 2).item()
+        
+        # PSNR
+        max_val = max(torch.max(original_volume).item(), torch.max(reconstructed_volume).item())
+        psnr = 20 * math.log10(max_val / max(1e-8, math.sqrt(mse)))
+        
+        metrics = {
+            'iou': iou,
+            'dice': dice,
             'precision': precision,
             'recall': recall,
-            'iou': iou,
             'f1': f1,
-            'num_original': num_original,
-            'num_reconstructed': num_reconstructed,
-            'num_intersection': num_intersection
+            'mse': mse,
+            'psnr': psnr
         }
+        
+        if self.debug:
+            print(f"  IoU: {iou:.4f}")
+            print(f"  Dice: {dice:.4f}")
+            print(f"  Precision: {precision:.4f}")
+            print(f"  Recall: {recall:.4f}")
+            print(f"  F1: {f1:.4f}")
+            print(f"  MSE: {mse:.6f}")
+            print(f"  PSNR: {psnr:.2f} dB")
+        
+        return metrics
+    
+    def optimize_sparse_point_intensities(self, candidate_points, target_projections, 
+                                         num_iterations=200, lr=0.01, pruning_threshold=0.05, 
+                                         pruning_interval=50, l1_weight=0.01):
+        """
+        Optimize the intensity values of a set of candidate 3D points to match target projections.
+        Only optimizes intensity values (alpha) while keeping point positions fixed.
+        Periodically prunes low-intensity points.
+        
+        Args:
+            candidate_points (torch.Tensor): Tensor of candidate point coordinates (N, 3)
+            target_projections (dict): Dictionary mapping plane_id to target projection data
+            num_iterations (int): Number of optimization iterations
+            lr (float): Learning rate for optimizer
+            pruning_threshold (float): Threshold for pruning low-intensity points
+            pruning_interval (int): Interval (in iterations) for pruning points
+            l1_weight (float): Weight for L1 regularization
+            
+        Returns:
+            tuple: (optimized_coords, optimized_values, loss_history, num_points_history)
+        """
+        import torch.optim as optim
+        
+        if self.debug:
+            start_time = time.time()
+            print(f"Optimizing intensities for {candidate_points.shape[0]} candidate points...")
+            print(f"  Iterations: {num_iterations}, Learning rate: {lr}")
+            print(f"  Pruning threshold: {pruning_threshold}, Interval: {pruning_interval}")
+        
+        # Move candidate points to device if needed
+        if candidate_points.device.type != self.device:
+            candidate_points = candidate_points.to(self.device)
+        
+        # Initialize intensity values with small random values
+        alpha_values = torch.rand(candidate_points.shape[0], device=self.device) * 0.1
+        alpha_values.requires_grad_(True)  # Only alpha values are trainable
+        
+        # Create optimizer for alpha values only
+        optimizer = optim.Adam([alpha_values], lr=lr)
+        
+        # Track optimization progress
+        loss_values = []
+        num_points_history = [candidate_points.shape[0]]
+        current_coords = candidate_points.clone()
+
+        # Warmup iterations
+        warmup_iterations = int(0.1 * num_iterations)        
+        # Optimization loop
+        for iteration in trange(num_iterations):
+            if self.debug and (iteration == 0 or (iteration + 1) % 20 == 0):
+                iter_start = time.time()
+                print(f"  Iteration {iteration+1}/{num_iterations}, Points: {current_coords.shape[0]}")
+            
+            # Create current sparse volume with optimized alpha values
+            current_sparse = (current_coords, alpha_values, self.volume_shape)
+            
+            # Forward pass: project current sparse volume
+            current_projections = self.project_sparse_volume_differentiable(current_sparse)
+            
+            # Calculate loss (MSE between original and current projections)
+            loss = 0
+            for plane_id in target_projections:
+                plane_loss = torch.mean(torch.abs(target_projections[plane_id] - current_projections[plane_id]))
+                loss += plane_loss
+                
+                if self.debug and (iteration == 0 or (iteration + 1) % 20 == 0):
+                    print(f"    Plane {plane_id} loss: {plane_loss.item():.6f}")
+            
+            # Add L1 regularization for sparsity
+            l1_reg = l1_weight * torch.mean(torch.abs(alpha_values))
+            loss += l1_reg
+            
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # Apply constraints: clamp alpha values to [0, 1] range
+            with torch.no_grad():
+                alpha_values.clamp_(0, 1)
+            
+            # Store loss
+            loss_values.append(loss.item())
+            
+            # Periodically prune low-alpha points after warmup period
+            if iteration >= warmup_iterations and (iteration + 1) % pruning_interval == 0:
+                with torch.no_grad():
+                    # Find points with alpha values above threshold
+                    valid_mask = alpha_values > pruning_threshold
+                    
+                    # Keep only valid points
+                    current_coords = current_coords[valid_mask]
+                    new_alpha_values = alpha_values[valid_mask].detach().clone()
+                    new_alpha_values.requires_grad_(True)
+                    
+                    # Replace the optimized parameter
+                    del optimizer  # Release the old optimizer
+                    alpha_values = new_alpha_values
+                    
+                    # Reduce learning rate over time
+                    new_lr = lr * (0.5 ** (iteration // pruning_interval))
+                    optimizer = optim.Adam([alpha_values], lr=new_lr)
+                    
+                    if self.debug:
+                        print(f"    Pruned to {current_coords.shape[0]} points (removed {(~valid_mask).sum().item()} points)")
+                        print(f"    New learning rate: {new_lr:.6f}")
+                    
+                    num_points_history.append(current_coords.shape[0])
+            
+            if self.debug and (iteration == 0 or (iteration + 1) % 20 == 0):
+                iter_end = time.time()
+                print(f"    Loss: {loss.item():.6f}, Time: {iter_end - iter_start:.2f}s")
+        
+        if self.debug:
+            end_time = time.time()
+            print(f"Optimization completed in {end_time - start_time:.2f} seconds")
+            print(f"Final number of points: {current_coords.shape[0]}")
+            print(f"Final loss: {loss_values[-1]:.6f}")
+        
+        return current_coords, alpha_values.detach(), loss_values, num_points_history
     
     def reconstruct_from_lines(self, lines_by_plane, snap_to_grid=True):
         """
