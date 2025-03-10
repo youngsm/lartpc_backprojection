@@ -375,40 +375,33 @@ class LineIntersectionSolver:
         # Find intersections between backprojected lines
         intersection_points = self.find_intersections(projections, fast_merge, snap_to_grid)
         
-        # Filter out points outside the volume
+        # Filter out points outside the volume bounds
         if intersection_points.size(0) > 0:
-            if self.debug:
-                filter_start = time.time()
-                print(f"Filtering {intersection_points.shape[0]} points to those inside the volume...")
+            # Create boundary conditions for the volume
+            volume_min = torch.zeros(3, device=self.device)
+            volume_max = torch.tensor(self.volume_shape, device=self.device) - 1
             
-            # Convert volume bounds to tensors
-            volume_min = torch.tensor(self.volume_min, device=self.device)
-            volume_max = torch.tensor(self.volume_max, device=self.device)
-            
-            # Create masks for points inside the volume
-            inside_min = torch.all(intersection_points >= volume_min, dim=1)
-            inside_max = torch.all(intersection_points < volume_max, dim=1)
-            inside_volume = inside_min & inside_max
+            # Check which points are within bounds
+            in_bounds = torch.all(
+                (intersection_points >= volume_min) & 
+                (intersection_points <= volume_max),
+                dim=1
+            )
             
             # Filter points
-            filtered_points = intersection_points[inside_volume]
+            points_in_bounds = intersection_points[in_bounds]
             
             if self.debug:
-                filter_end = time.time()
-                print(f"  Filtered to {filtered_points.shape[0]} points inside the volume")
-                print(f"  Filtering completed in {filter_end - filter_start:.2f} seconds")
-                
-                end_time = time.time()
-                print(f"Inverse problem solved in {end_time - start_time:.2f} seconds")
+                filtered_count = intersection_points.size(0) - points_in_bounds.size(0)
+                if filtered_count > 0:
+                    print(f"  Filtered out {filtered_count} points outside volume bounds")
+                print(f"  Final reconstructed points: {points_in_bounds.size(0)}")
             
-            return filtered_points
+            return points_in_bounds
         else:
             if self.debug:
-                end_time = time.time()
-                print("No intersection points found")
-                print(f"Inverse problem solved in {end_time - start_time:.2f} seconds")
-            
-            return intersection_points
+                print("  No intersections found")
+            return torch.zeros((0, 3), device=self.device)
     
     def lines_from_numpy_array(self, array, plane_id):
         """

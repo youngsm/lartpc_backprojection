@@ -78,16 +78,14 @@ def visualize_projections(projections, figsize=(15, 5), lognorm=False):
         axes = [axes]
     
     # Map plane_id to angle labels
-    angle_labels = {0: '0°', 1: '90°', 2: '60°', 3: '120°'}
     
     # Plot each projection
     for i, (plane_id, proj) in enumerate(projections_np.items()):
         # Get angle label
-        angle = angle_labels.get(plane_id, f'Plane {plane_id}')
         
         # Plot projection
         im = axes[i].imshow(proj.T, aspect='auto', origin='lower', cmap='viridis', interpolation='none', norm=LogNorm() if lognorm else None)
-        axes[i].set_title(f'Projection ({angle})')
+        axes[i].set_title(f'Projection {i}')
         axes[i].set_xlabel('X (drift)')
         axes[i].set_ylabel('U (wire)')
         plt.colorbar(im, ax=axes[i])

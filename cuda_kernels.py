@@ -947,7 +947,7 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
         # Calculate max u value (account for projection angle)
         sin_theta = torch.sin(torch.tensor(theta, device=device))
         cos_theta = torch.cos(torch.tensor(theta, device=device))
-        u_max = max_y * cos_theta + max_z * sin_theta
+        u_max = -max_y * sin_theta + max_z * cos_theta
         
         # Projection size is (x_size, u_size)
         u_size = int(torch.ceil(u_max - u_min).item()) + 1
@@ -960,29 +960,67 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
     cos_theta = torch.cos(torch.tensor(theta, device=device))
     
     # Calculate u coordinates for each point
-    u_coords = sorted_coords[:, 1] * cos_theta + sorted_coords[:, 2] * sin_theta - u_min
+    u_coords = -sorted_coords[:, 1] * sin_theta + sorted_coords[:, 2] * cos_theta - u_min
     
-    # Round to get integer indices for u
-    u_indices = torch.clamp(torch.round(u_coords).long(), 0, u_size - 1)
+    # Use floor and ceil to properly distribute contribution
+    # This allows for more accurate bilinear interpolation
+    u_lower = torch.floor(u_coords).long()
+    u_upper = u_lower + 1
+    
+    # Calculate weights for bilinear interpolation
+    u_weight_upper = u_coords - u_lower.float()
+    u_weight_lower = 1.0 - u_weight_upper
     
     # Get x indices
-    x_indices = sorted_coords[:, 0]
+    x_indices = sorted_coords[:, 0].long()
     
     # Filter out indices that would be outside the projection
-    valid_mask = (x_indices >= 0) & (x_indices < x_size)
-    x_indices = x_indices[valid_mask]
-    u_indices = u_indices[valid_mask]
-    point_values = sorted_values[valid_mask]
+    # For lower u indices
+    valid_mask_lower = (x_indices >= 0) & (x_indices < x_size) & \
+                       (u_lower >= 0) & (u_lower < u_size)
     
-    # Create 2D indices for scatter operation
-    indices = torch.stack([x_indices, u_indices], dim=0)
+    # For upper u indices
+    valid_mask_upper = (x_indices >= 0) & (x_indices < x_size) & \
+                       (u_upper >= 0) & (u_upper < u_size)
     
-    # Create a sparse tensor with contributions, then densify it
-    projection = torch.sparse_coo_tensor(
-        indices, 
-        point_values,
-        size=(x_size, u_size),
-        device=device
-    ).to_dense()
+    # Create sparse tensors for each contribution
+    # Lower u contribution
+    if valid_mask_lower.any():
+        indices_lower = torch.stack([x_indices[valid_mask_lower], u_lower[valid_mask_lower]], dim=0)
+        values_lower = sorted_values[valid_mask_lower] * u_weight_lower[valid_mask_lower]
+        lower_contribution = torch.sparse_coo_tensor(
+            indices_lower, 
+            values_lower,
+            size=(x_size, u_size),
+            device=device
+        )
+    else:
+        lower_contribution = torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.long, device=device),
+            torch.zeros(0, device=device),
+            size=(x_size, u_size),
+            device=device
+        )
+    
+    # Upper u contribution
+    if valid_mask_upper.any():
+        indices_upper = torch.stack([x_indices[valid_mask_upper], u_upper[valid_mask_upper]], dim=0)
+        values_upper = sorted_values[valid_mask_upper] * u_weight_upper[valid_mask_upper]
+        upper_contribution = torch.sparse_coo_tensor(
+            indices_upper, 
+            values_upper,
+            size=(x_size, u_size),
+            device=device
+        )
+    else:
+        upper_contribution = torch.sparse_coo_tensor(
+            torch.zeros((2, 0), dtype=torch.long, device=device),
+            torch.zeros(0, device=device),
+            size=(x_size, u_size),
+            device=device
+        )
+    
+    # Sum the contributions and convert to dense tensor
+    projection = (lower_contribution + upper_contribution).to_dense()
     
     return projection

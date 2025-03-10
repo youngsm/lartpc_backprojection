@@ -192,12 +192,15 @@ def create_volume_from_points(points, volume_shape, radius=0.0, device="cuda"):
 
     return sparse_volume, dense_volume, points
 
-def run_realistic_sparse_reconstruction():
+def run_realistic_sparse_reconstruction(optimization_method='adam'):
     """
     Demonstrate a realistic sparse point-based differentiable reconstruction.
     Uses the actual backprojection process to get candidate points.
+    
+    Args:
+        optimization_method (str): The optimization method to use, either 'adam' or 'admm'
     """
-    print("Running realistic sparse point-based differentiable reconstruction...")
+    print(f"Running realistic sparse point-based differentiable reconstruction using {optimization_method.upper()}...")
     
     # Use CUDA if available
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -230,7 +233,7 @@ def run_realistic_sparse_reconstruction():
     
     # Create reconstructor with three planes
     print("Creating reconstructor with 3 planes...")
-    plane_angles = {0: 0.0, 1: np.pi/3, 2: 2*np.pi/3}  # Three planes at different angles
+    plane_angles = {0: 0.0, 1: -np.pi/6, 2: np.pi/6}  # Three planes at different angles
     reconstructor = LArTPCReconstructor(
         volume_shape=volume_shape, 
         device=device,
@@ -244,8 +247,8 @@ def run_realistic_sparse_reconstruction():
     
     # Visualize ground truth and projections
     print("Visualizing ground truth and projections...")
-    visualize_volume(ground_truth.cpu().numpy(), threshold=0.1)
-    visualize_projections({k: v.cpu().detach().numpy() for k, v in projections.items()})
+    visualize_volume(ground_truth.cpu().numpy(), threshold=0.0).savefig(f"img/realistic_ground_truth_{optimization_method}.png")
+    visualize_projections({k: v.cpu().detach().numpy() for k, v in projections.items()}).savefig(f"img/realistic_projections_{optimization_method}.png")
     
     # Threshold the projections to simulate detector hits
     print("Thresholding projections to simulate detector hits...")
@@ -272,49 +275,69 @@ def run_realistic_sparse_reconstruction():
     # Visualize candidate points
     candidate_volume = torch.zeros(volume_shape, device=device)
     candidate_volume[candidate_points[:, 0].long(), candidate_points[:, 1].long(), candidate_points[:, 2].long()] = 1.0
-    visualize_volume(candidate_volume.cpu().numpy(), threshold=0.1)
+    visualize_volume(candidate_volume.cpu().numpy(), threshold=0.0).savefig(f"img/realistic_candidate_points_{optimization_method}.png")
     
     # Optimize the intensities of these candidate points
-    print("Optimizing intensities of candidate points...")
+    print(f"Optimizing intensities of candidate points using {optimization_method.upper()}...")
     
     # Convert candidate points to long for indexing
     candidate_points_long = candidate_points.long()
     
     # Optimization parameters
-    num_iterations = 7000
+    num_iterations = 5000 if optimization_method == 'adam' else 200  # ADMM typically needs fewer iterations
     learning_rate = 0.01
-    pruning_threshold = 0.001
-    pruning_interval = 5000
-    l1_weight = 0.1
+    pruning_threshold = 0.01
+    pruning_interval = 250 if optimization_method == 'adam' else 10000
+    l1_weight = 0.01
     
-    # Run optimization
-    optimized_coords, optimized_values, loss_history, num_points_history = reconstructor.optimize_sparse_point_intensities(
-        candidate_points=candidate_points_long,
-        target_projections=projections,
-        num_iterations=num_iterations,
-        lr=learning_rate,
-        pruning_threshold=pruning_threshold,
-        pruning_interval=pruning_interval,
-        l1_weight=l1_weight
-    )
+    # Run optimization with the specified method
+    if optimization_method == 'adam':
+        # Use Adam (SGD) optimization
+        optimized_coords, optimized_values, loss_history, num_points_history = reconstructor.optimize_sparse_point_intensities(
+            candidate_points=candidate_points_long,
+            target_projections=projections,
+            num_iterations=num_iterations,
+            lr=learning_rate,
+            pruning_threshold=pruning_threshold,
+            pruning_interval=pruning_interval,
+            l1_weight=l1_weight,
+        )
+    else:  # 'admm'
+        # Use ADMM optimization
+        rho = 1.0
+        alpha = 1.0
+        relaxation = 1.0
+        optimized_coords, optimized_values, loss_history, num_points_history = reconstructor.optimize_sparse_point_intensities_admm(
+            candidate_points=candidate_points_long,
+            target_projections=projections,
+            num_iterations=num_iterations,
+            rho=rho,
+            alpha=alpha,
+            pruning_threshold=pruning_threshold,
+            pruning_interval=pruning_interval,
+            l1_weight=l1_weight,
+            relaxation=relaxation
+        )
     
     # Convert final result to dense for visualization
     final_volume = torch.zeros(volume_shape, device=device)
     final_volume[optimized_coords[:, 0], optimized_coords[:, 1], optimized_coords[:, 2]] = optimized_values
     
     # Calculate metrics
-    metrics = reconstructor.evaluate_reconstruction(ground_truth, final_volume, threshold=0.1)
+    metrics = reconstructor.evaluate_reconstruction(ground_truth, final_volume, threshold=0.0)
     
     # Visualize final results
     print("Visualizing final results...")
-    visualize_volume(final_volume.cpu().numpy(), threshold=0)
+    visualize_volume(final_volume.cpu().numpy(), threshold=0.0).savefig(f"img/realistic_final_volume_{optimization_method}.png")
     
     # Compare original and reconstructed
-    visualize_original_vs_reconstructed(
+    fig = visualize_original_vs_reconstructed(
         ground_truth.cpu().numpy(), 
         final_volume.cpu().numpy(), 
         # threshold=0.1
     )
+    fig.savefig(f"img/realistic_original_vs_reconstructed_{optimization_method}.png")
+    plt.close(fig)
     
     # Visualize comparison of projections
     final_projections = reconstructor.project_sparse_volume_differentiable(
@@ -338,12 +361,12 @@ def run_realistic_sparse_reconstruction():
         plt.colorbar(im, ax=axes[i, 1])
     
     plt.tight_layout()
-    plt.savefig("img/realistic_projection_comparison.png")
+    plt.savefig(f"img/realistic_projection_comparison_{optimization_method}.png")
     plt.close()
     
     # Calculate how many original points are included in the reconstruction
     # An original point is considered "included" if there's a reconstructed point close to it
-    inclusion_threshold = 3.0  # Maximum distance for a point to be considered included
+    inclusion_threshold = 1.1  # Maximum distance for a point to be considered included
     original_points_array = torch.stack(original_points) if isinstance(original_points, list) else original_points
     total_original_points = len(original_points_array)
     
@@ -366,42 +389,171 @@ def run_realistic_sparse_reconstruction():
     # Plot loss curve
     plt.figure(figsize=(10, 6))
     plt.plot(loss_history)
-    plt.title(f'Loss During Optimization\n'
+    plt.title(f'Loss During {optimization_method.upper()} Optimization\n'
               f'Original: {total_original_points} points, '
               f'Included: {included_count} ({inclusion_percentage:.2f}%)')
     plt.xlabel('Iteration')
     plt.ylabel('Loss')
     plt.yscale('log')
     plt.grid(True)
-    plt.savefig("img/realistic_optimization_loss.png")
+    plt.savefig(f"img/realistic_optimization_loss_{optimization_method}.png")
     plt.close()
     
     # Plot number of points over iterations
     pruning_iterations = [i * pruning_interval for i in range(len(num_points_history))]
     plt.figure(figsize=(10, 6))
     plt.plot(pruning_iterations, num_points_history, 'o-')
-    plt.title(f'Number of Points During Optimization\n'
+    plt.title(f'Number of Points During {optimization_method.upper()} Optimization\n'
               f'Original: {total_original_points} points, '
               f'Included: {included_count} ({inclusion_percentage:.2f}%)')
     plt.xlabel('Iteration')
     plt.ylabel('Number of Points')
     plt.grid(True)
-    plt.savefig("img/realistic_point_count.png")
+    plt.savefig(f"img/realistic_points_history_{optimization_method}.png")
     plt.close()
     
-    # Print summary of results
-    print("\nReconstruction Results Summary:")
-    print(f"  Initial candidate points: {candidate_points.shape[0]}")
-    print(f"  Final optimized points: {optimized_coords.shape[0]}")
-    print(f"  IoU: {metrics['iou']:.4f}")
-    print(f"  Dice: {metrics['dice']:.4f}")
-    print(f"  Precision: {metrics['precision']:.4f}")
-    print(f"  Recall: {metrics['recall']:.4f}")
-    print(f"  F1 Score: {metrics['f1']:.4f}")
-    print(f"  PSNR: {metrics['psnr']:.2f} dB")
+    # Print a summary of the metrics, including non-zero PSNR
+    print(f"\nMetrics for {optimization_method.upper()} reconstruction:")
+    # Standard metrics
+    standard_metrics = ['iou', 'dice', 'precision', 'recall', 'f1', 'mse', 'psnr']
+    for metric_name in standard_metrics:
+        if metric_name in metrics:
+            print(f"  {metric_name}: {metrics[metric_name]:.6f}")
     
-    print("\nExample complete! Results saved as realistic_projection_comparison.png, "
-          "realistic_optimization_loss.png, and realistic_point_count.png")
+    # Non-zero metrics with emphasis
+    special_metrics = ['mse_nonzero', 'psnr_nonzero']
+    if any(m in metrics for m in special_metrics):
+        print("\n  Non-zero region metrics (only considering pixels where target > 0):")
+        for metric_name in special_metrics:
+            if metric_name in metrics:
+                print(f"    {metric_name}: {metrics[metric_name]:.6f}")
+        
+    return metrics, final_volume
 
+# If this script is run directly, run the example
 if __name__ == "__main__":
-    run_realistic_sparse_reconstruction() 
+    import argparse
+    parser = argparse.ArgumentParser(description='Run realistic sparse reconstruction example')
+    parser.add_argument('--method', type=str, choices=['adam', 'admm', 'both'], default='both',
+                        help='Optimization method to use: adam, admm, or both')
+    args = parser.parse_args()
+    
+    # Create img directory if it doesn't exist
+    os.makedirs('img', exist_ok=True)
+    
+    # Define inputs for visualization
+    input_points = []
+    
+    # Create example structures
+    helix_points = create_helix(start=(40, 40, 20), radius=20, height=60, turns=3, num_points=500)
+    sine_points = create_sine_wave(start=(20, 60, 60), length=80, amplitude=20, periods=2, num_points=500)
+    second_sine = create_sine_wave(start=(20, 30, 30), length=80, amplitude=15, periods=3, num_points=500)
+    
+    # Add to input points
+    input_points.extend(helix_points)
+    input_points.extend(sine_points)
+    input_points.extend(second_sine)
+    
+    # Convert to tensor
+    input_points = torch.tensor(input_points, dtype=torch.float32)
+    
+    if args.method == 'adam':
+        # Run with Adam only
+        run_realistic_sparse_reconstruction(optimization_method='adam')
+    elif args.method == 'admm':
+        # Run with ADMM only
+        run_realistic_sparse_reconstruction(optimization_method='admm')
+    else:  # 'both'
+        # Run with both methods and compare
+        print("\n========== Running with Adam optimization ==========\n")
+        adam_metrics, adam_volume = run_realistic_sparse_reconstruction(optimization_method='adam')
+        
+        print("\n========== Running with ADMM optimization ==========\n")
+        admm_metrics, admm_volume = run_realistic_sparse_reconstruction(optimization_method='admm')
+        
+        # Compare metrics
+        print("\n========== Comparison of Metrics ==========")
+        print(f"{'Metric':<20} {'Adam':<15} {'ADMM':<15} {'Difference':<15}")
+        print("-" * 65)
+        
+        # First standard metrics
+        standard_metrics = ['iou', 'dice', 'precision', 'recall', 'f1', 'mse', 'psnr']
+        for metric in standard_metrics:
+            if metric in adam_metrics:
+                adam_val = adam_metrics[metric]
+                admm_val = admm_metrics[metric]
+                diff = admm_val - adam_val
+                print(f"{metric:<20} {adam_val:<15.6f} {admm_val:<15.6f} {diff:<15.6f}")
+        
+        # Then non-zero metrics with emphasis
+        special_metrics = ['mse_nonzero', 'psnr_nonzero']
+        if any(m in adam_metrics for m in special_metrics):
+            print("\nNon-zero region metrics (only considering pixels where target > 0):")
+            print("-" * 65)
+            for metric in special_metrics:
+                if metric in adam_metrics:
+                    adam_val = adam_metrics[metric]
+                    admm_val = admm_metrics[metric]
+                    diff = admm_val - adam_val
+                    print(f"{metric:<20} {adam_val:<15.6f} {admm_val:<15.6f} {diff:<15.6f}")
+        
+        # Create a direct visual comparison of the two reconstructions and metrics
+        print("\nGenerating side-by-side comparison of reconstructions...")
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        
+        im1 = axes[0].imshow(np.max(adam_volume.cpu().numpy(), axis=0), cmap='viridis')
+        axes[0].set_title("Adam Reconstruction")
+        plt.colorbar(im1, ax=axes[0])
+        
+        im2 = axes[1].imshow(np.max(admm_volume.cpu().numpy(), axis=0), cmap='viridis')
+        axes[1].set_title("ADMM Reconstruction")
+        plt.colorbar(im2, ax=axes[1])
+        
+        plt.tight_layout()
+        plt.savefig("img/adam_vs_admm_comparison.png")
+        plt.close()
+        
+        # Add a special visualization for PSNR comparison
+        if ('psnr' in adam_metrics and 'psnr' in admm_metrics and 
+            'psnr_nonzero' in adam_metrics and 'psnr_nonzero' in admm_metrics):
+            print("\nGenerating PSNR comparison chart...")
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            # Data to plot
+            methods = ['Adam', 'ADMM']
+            psnr_standard = [adam_metrics['psnr'], admm_metrics['psnr']]
+            psnr_nonzero = [adam_metrics['psnr_nonzero'], admm_metrics['psnr_nonzero']]
+            
+            # Set up width and positions
+            x = np.arange(len(methods))
+            width = 0.35
+            
+            # Create bars
+            rects1 = ax.bar(x - width/2, psnr_standard, width, label='Standard PSNR', color='skyblue')
+            rects2 = ax.bar(x + width/2, psnr_nonzero, width, label='Non-zero PSNR', color='orange')
+            
+            # Add labels, title, and legend
+            ax.set_ylabel('PSNR (dB)')
+            ax.set_title('PSNR Comparison: All Pixels vs. Non-Zero Pixels Only')
+            ax.set_xticks(x)
+            ax.set_xticklabels(methods)
+            ax.legend()
+            
+            # Add value labels on bars
+            def autolabel(rects):
+                for rect in rects:
+                    height = rect.get_height()
+                    ax.annotate(f'{height:.2f}',
+                                xy=(rect.get_x() + rect.get_width()/2, height),
+                                xytext=(0, 3),
+                                textcoords="offset points",
+                                ha='center', va='bottom')
+            
+            autolabel(rects1)
+            autolabel(rects2)
+            
+            plt.tight_layout()
+            plt.savefig("img/adam_vs_admm_psnr_comparison.png")
+            plt.close()
+        
+        print("\nComparison completed. Check the 'img' directory for output images.") 

@@ -724,6 +724,24 @@ class LArTPCReconstructor:
         max_val = max(torch.max(original_volume).item(), torch.max(reconstructed_volume).item())
         psnr = 20 * math.log10(max_val / max(1e-8, math.sqrt(mse)))
         
+        # PSNR only on non-zero pixels of the target image
+        # Create a mask for non-zero pixels in the original volume
+        non_zero_mask = original_volume > 0
+        
+        # If there are any non-zero pixels, compute PSNR only on those
+        if torch.any(non_zero_mask):
+            # Extract original and reconstructed values at non-zero locations
+            original_nonzero = original_volume[non_zero_mask]
+            reconstructed_nonzero = reconstructed_volume[non_zero_mask]
+            
+            # Calculate MSE and PSNR on non-zero regions only
+            mse_nonzero = torch.mean((original_nonzero - reconstructed_nonzero) ** 2).item()
+            psnr_nonzero = 20 * math.log10(max_val / max(1e-8, math.sqrt(mse_nonzero)))
+        else:
+            # If no non-zero pixels, set to same as regular PSNR
+            psnr_nonzero = psnr
+            mse_nonzero = mse
+        
         metrics = {
             'iou': iou,
             'dice': dice,
@@ -731,7 +749,9 @@ class LArTPCReconstructor:
             'recall': recall,
             'f1': f1,
             'mse': mse,
-            'psnr': psnr
+            'psnr': psnr,
+            'mse_nonzero': mse_nonzero,
+            'psnr_nonzero': psnr_nonzero
         }
         
         if self.debug:
@@ -742,6 +762,8 @@ class LArTPCReconstructor:
             print(f"  F1: {f1:.4f}")
             print(f"  MSE: {mse:.6f}")
             print(f"  PSNR: {psnr:.2f} dB")
+            print(f"  MSE (non-zero only): {mse_nonzero:.6f}")
+            print(f"  PSNR (non-zero only): {psnr_nonzero:.2f} dB")
         
         return metrics
     
@@ -778,7 +800,7 @@ class LArTPCReconstructor:
             candidate_points = candidate_points.to(self.device)
         
         # Initialize intensity values with small random values
-        alpha_values = torch.rand(candidate_points.shape[0], device=self.device) * 0.1
+        alpha_values = torch.ones(candidate_points.shape[0], device=self.device)
         alpha_values.requires_grad_(True)  # Only alpha values are trainable
         
         # Create optimizer for alpha values only
@@ -864,6 +886,297 @@ class LArTPCReconstructor:
             print(f"Final loss: {loss_values[-1]:.6f}")
         
         return current_coords, alpha_values.detach(), loss_values, num_points_history
+    
+    def optimize_sparse_point_intensities_admm(self, candidate_points, target_projections, 
+                                              num_iterations=100, rho=1.0, alpha=1.5, 
+                                              pruning_threshold=0.05, pruning_interval=20,
+                                              l1_weight=0.01, relaxation=1.0):
+        """
+        Optimize the intensity values of a set of candidate 3D points to match target projections
+        using the Alternating Direction Method of Multipliers (ADMM). This is an alternative to
+        the SGD-based approach, which can handle constraints more effectively.
+        
+        Args:
+            candidate_points (torch.Tensor): Tensor of candidate point coordinates (N, 3)
+            target_projections (dict): Dictionary mapping plane_id to target projection data
+            num_iterations (int): Number of ADMM iterations
+            rho (float): Penalty parameter for ADMM
+            alpha (float): Over-relaxation parameter (typically between 1.0 and 1.8)
+            pruning_threshold (float): Threshold for pruning low-intensity points
+            pruning_interval (int): Interval (in iterations) for pruning points
+            l1_weight (float): Weight for L1 regularization term (sparsity)
+            relaxation (float): Relaxation parameter for ADMM updates (typically 1.0-1.8)
+            
+        Returns:
+            tuple: (optimized_coords, optimized_values, loss_history, num_points_history)
+        """
+        if self.debug:
+            start_time = time.time()
+            print(f"Optimizing intensities for {candidate_points.shape[0]} candidate points using ADMM...")
+            print(f"  Iterations: {num_iterations}, Rho: {rho}, Alpha: {alpha}")
+            print(f"  Pruning threshold: {pruning_threshold}, Interval: {pruning_interval}")
+        
+        # Move candidate points to device if needed
+        if candidate_points.device.type != self.device:
+            candidate_points = candidate_points.to(self.device)
+        
+        # Initialize intensity values with small random values
+        alpha_values = torch.rand(candidate_points.shape[0], device=self.device) * 0.1
+        
+        # Number of planes (projections)
+        num_planes = len(target_projections)
+        
+        # Create auxiliary variables and dual variables (Lagrangian multipliers)
+        # One set for each projection plane
+        z_vars = {}
+        u_vars = {}
+        
+        # Initialize auxiliary variables (one for each projection plane)
+        for plane_id in target_projections:
+            # Create current sparse volume with initial alpha values
+            current_sparse = (candidate_points, alpha_values, self.volume_shape)
+            
+            # Project current sparse volume to get initial projections
+            initial_projections = self.project_sparse_volume_differentiable(current_sparse)
+            
+            # Initialize z as the initial projection
+            z_vars[plane_id] = initial_projections[plane_id].clone()
+            
+            # Initialize dual variables u as zeros with same shape as projection
+            u_vars[plane_id] = torch.zeros_like(z_vars[plane_id])
+        
+        # Track optimization progress
+        loss_values = []
+        num_points_history = [candidate_points.shape[0]]
+        current_coords = candidate_points.clone()
+        
+        # Warm-up iterations
+        warmup_iterations = int(0.1 * num_iterations)
+        
+        # Optimization loop
+        for iteration in trange(num_iterations):
+            if self.debug and (iteration == 0 or (iteration + 1) % 10 == 0):
+                iter_start = time.time()
+                print(f"  Iteration {iteration+1}/{num_iterations}, Points: {current_coords.shape[0]}")
+            
+            # Step 1: x-update (volume update)
+            # This requires solving a least-squares problem with regularization
+            
+            # Accumulate terms for the x-update
+            grad_sum = torch.zeros_like(alpha_values)
+            hessian_diag = torch.zeros_like(alpha_values)
+            
+            # Process each plane
+            for plane_id in target_projections:
+                # Create current sparse volume with the alpha values
+                current_sparse = (current_coords, alpha_values, self.volume_shape)
+                
+                # Get the projection operator for this plane
+                # We need to compute the Jacobian of the projection w.r.t. alpha values
+                # We'll do this by computing projections with autograd enabled
+                alpha_values.requires_grad_(True)
+                
+                # Forward projection
+                proj = self.project_sparse_volume_differentiable(current_sparse)[plane_id]
+                
+                # Compute Ax - b + u (residual)
+                residual = proj - z_vars[plane_id] + u_vars[plane_id]
+                
+                # Compute gradient w.r.t. alpha values
+                residual_sum = torch.sum(residual)
+                residual_sum.backward()
+                
+                # Extract and accumulate gradient
+                if alpha_values.grad is not None:
+                    grad_sum += rho * alpha_values.grad
+                    
+                    # Approximate Hessian diagonal for preconditioned update
+                    # This is a simple approximation; a more accurate approach would compute 
+                    # the full Hessian or use automatic differentiation for matrix-free operations
+                    hessian_diag += rho * (alpha_values.grad ** 2 + 1e-8)
+                    
+                    # Reset gradient
+                    alpha_values.grad.zero_()
+                
+                alpha_values.requires_grad_(False)
+            
+            # Add regularization term gradient
+            grad_sum += l1_weight * torch.sign(alpha_values)
+            hessian_diag += l1_weight
+            
+            # Preconditioned gradient descent update for alpha values
+            step_size = 1.0 / (hessian_diag + 1e-8)  # Avoid division by zero
+            alpha_values = alpha_values - step_size * grad_sum
+            
+            # Project to non-negative values (enforce constraint)
+            alpha_values = torch.clamp(alpha_values, 0, 1)
+            
+            # Step 2: z-update (data fitting step)
+            # For each projection plane, update z to minimize the augmented Lagrangian
+            for plane_id in target_projections:
+                # Create current sparse volume with updated alpha values
+                current_sparse = (current_coords, alpha_values, self.volume_shape)
+                
+                # Get current projection
+                current_proj = self.project_sparse_volume_differentiable(current_sparse)[plane_id]
+                
+                # Over-relaxation step
+                current_proj_relaxed = relaxation * current_proj + (1 - relaxation) * z_vars[plane_id]
+                
+                # Solve for z: min_z ||z - b||^2 + (rho/2)||z - Ax - u||^2
+                # Closed-form solution: z = (b + rho*(Ax + u))/(1 + rho)
+                target_proj = target_projections[plane_id]
+                z_vars[plane_id] = (target_proj + rho * (current_proj_relaxed + u_vars[plane_id])) / (1 + rho)
+            
+            # Step 3: u-update (dual variable update)
+            # For each projection plane, update the dual variables
+            primal_residual_norm = 0
+            dual_residual_norm = 0
+            
+            for plane_id in target_projections:
+                # Create current sparse volume with updated alpha values
+                current_sparse = (current_coords, alpha_values, self.volume_shape)
+                
+                # Get current projection
+                current_proj = self.project_sparse_volume_differentiable(current_sparse)[plane_id]
+                
+                # Previous z value for calculating dual residual
+                prev_z = z_vars[plane_id].clone()
+                
+                # Dual variable update: u = u + Ax - z
+                u_vars[plane_id] = u_vars[plane_id] + current_proj - z_vars[plane_id]
+                
+                # Calculate residuals for convergence checking
+                primal_residual = current_proj - z_vars[plane_id]
+                primal_residual_norm += torch.norm(primal_residual).item()
+                
+                # Dual residual for this plane
+                dual_residual = rho * (z_vars[plane_id] - prev_z)
+                dual_residual_norm += torch.norm(dual_residual).item()
+            
+            # Calculate and store loss
+            loss = 0
+            for plane_id in target_projections:
+                # Create current sparse volume with updated alpha values
+                current_sparse = (current_coords, alpha_values, self.volume_shape)
+                
+                # Get current projection
+                current_proj = self.project_sparse_volume_differentiable(current_sparse)[plane_id]
+                
+                # Mean absolute error between projections
+                plane_loss = torch.mean(torch.abs(target_projections[plane_id] - current_proj))
+                loss += plane_loss.item()
+                
+                if self.debug and (iteration == 0 or (iteration + 1) % 10 == 0):
+                    print(f"    Plane {plane_id} loss: {plane_loss.item():.6f}")
+            
+            # Add regularization loss
+            l1_loss = l1_weight * torch.mean(torch.abs(alpha_values)).item()
+            loss += l1_loss
+            loss_values.append(loss)
+            
+            # Adaptive rho update based on residuals
+            # This is a common heuristic to adjust rho during ADMM iterations
+            if primal_residual_norm > 10 * dual_residual_norm:
+                rho *= 2
+            elif dual_residual_norm > 10 * primal_residual_norm:
+                rho /= 2
+                
+            # Log convergence metrics
+            if self.debug and (iteration == 0 or (iteration + 1) % 10 == 0):
+                print(f"    Primal residual: {primal_residual_norm:.6f}, Dual residual: {dual_residual_norm:.6f}")
+                print(f"    Updated rho: {rho:.6f}, Total loss: {loss:.6f}")
+                print(f"    L1 regularization: {l1_loss:.6f}")
+                
+            # Periodically prune low-alpha points after warmup period
+            if iteration >= warmup_iterations and (iteration + 1) % pruning_interval == 0:
+                # Find points with alpha values above threshold
+                valid_mask = alpha_values > pruning_threshold
+                
+                # Keep only valid points
+                current_coords = current_coords[valid_mask]
+                alpha_values = alpha_values[valid_mask]
+                
+                # Update number of points history
+                num_points_history.append(current_coords.shape[0])
+                
+                if self.debug:
+                    print(f"    Pruned to {current_coords.shape[0]} points")
+                    
+                # If all points are pruned, break early
+                if current_coords.shape[0] == 0:
+                    print("Warning: All points were pruned. Consider lowering the pruning threshold.")
+                    break
+                    
+        if self.debug:
+            end_time = time.time()
+            print(f"ADMM optimization completed in {end_time - start_time:.2f} seconds")
+            print(f"Final number of points: {current_coords.shape[0]}")
+            print(f"Final loss: {loss_values[-1]:.6f}")
+            
+        return current_coords, alpha_values, loss_values, num_points_history
+
+    def reconstruct_sparse_volume_admm(self, projections, threshold=0.1, voxel_size=1.0, 
+                                      num_iterations=100, rho=1.0, alpha=1.5,
+                                      pruning_threshold=0.05, pruning_interval=20,
+                                      l1_weight=0.01, fast_merge=True, snap_to_grid=True):
+        """
+        Reconstruct a sparse volume from projections using the ADMM algorithm.
+        
+        Args:
+            projections (dict): Dictionary mapping plane_id to projection data
+            threshold (float): Threshold value for candidate point extraction
+            voxel_size (float): Size of voxels for placing candidate points
+            num_iterations (int): Number of ADMM iterations
+            rho (float): Penalty parameter for ADMM
+            alpha (float): Over-relaxation parameter (typically between 1.0 and 1.8)
+            pruning_threshold (float): Threshold for pruning low-intensity points
+            pruning_interval (int): Interval (in iterations) for pruning points
+            l1_weight (float): Weight for L1 regularization (sparsity)
+            fast_merge (bool): Whether to use the fast merge algorithm for intersections
+            snap_to_grid (bool): Whether to snap intersection points to grid
+            
+        Returns:
+            tuple: (coords, values, volume_shape) representing a sparse volume
+                  coords: Coordinates of non-zero voxels (N, 3)
+                  values: Values at those coordinates (N)
+                  volume_shape: Shape of the full volume (x_size, y_size, z_size)
+        """
+        if self.debug:
+            start_time = time.time()
+            print(f"Reconstructing sparse volume from {len(projections)} projections using ADMM...")
+            
+        # 1. Get candidate points using the existing intersection method
+        candidate_points = self.reconstruct_from_projections(
+            projections, 
+            threshold=threshold, 
+            fast_merge=fast_merge,
+            snap_to_grid=snap_to_grid
+        )
+        
+        if self.debug:
+            print(f"Found {candidate_points.shape[0]} candidate points from intersections")
+            
+        # 2. Optimize the intensity values using ADMM
+        optimized_coords, optimized_values, loss_history, num_points_history = \
+            self.optimize_sparse_point_intensities_admm(
+                candidate_points,
+                projections,
+                num_iterations=num_iterations,
+                rho=rho,
+                alpha=alpha,
+                pruning_threshold=pruning_threshold,
+                pruning_interval=pruning_interval,
+                l1_weight=l1_weight
+            )
+            
+        if self.debug:
+            end_time = time.time()
+            print(f"Reconstruction completed in {end_time - start_time:.2f} seconds")
+            print(f"Final sparse volume has {optimized_coords.shape[0]} non-zero voxels")
+            
+        # Return sparse volume representation
+        return (optimized_coords, optimized_values, self.volume_shape)
     
     def reconstruct_from_lines(self, lines_by_plane, snap_to_grid=True):
         """
