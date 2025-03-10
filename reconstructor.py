@@ -10,8 +10,7 @@ class LArTPCReconstructor:
     A high-level class that combines methods for projecting, backprojecting,
     and finding intersections for LArTPC reconstruction.
     """
-    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False, plane_angles=None,
-                 enable_diffusion=False, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, attenuation_coeff=0.0):
+    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False, plane_angles=None):
         """
         Initialize the reconstructor.
         
@@ -23,10 +22,6 @@ class LArTPCReconstructor:
             debug (bool): Whether to print debug information
             plane_angles (dict, optional): Dictionary mapping plane_id to angle in radians.
                                         If None, uses default angles (0°, 90°, 60°, 120°).
-            enable_diffusion (bool): Whether to enable electron diffusion effects
-            diffusion_sigma_t (float): Transverse diffusion coefficient (perpendicular to drift)
-            diffusion_sigma_l (float): Longitudinal diffusion coefficient (along drift direction)
-            attenuation_coeff (float): Electron attenuation coefficient due to impurities
         """
         self.volume_shape = volume_shape
         self.tolerance = tolerance
@@ -34,12 +29,6 @@ class LArTPCReconstructor:
         self.device = device
         self.debug = debug
         self.plane_angles = plane_angles
-        
-        # LArTPC physics simulation parameters
-        self.enable_diffusion = enable_diffusion
-        self.diffusion_sigma_t = diffusion_sigma_t
-        self.diffusion_sigma_l = diffusion_sigma_l
-        self.attenuation_coeff = attenuation_coeff
         
         # Create the solver
         self.solver = LineIntersectionSolver(
@@ -142,10 +131,6 @@ class LArTPCReconstructor:
                 u_min=u_min, 
                 device=self.device, 
                 projection_size=projection_size,
-                enable_diffusion=self.enable_diffusion,
-                diffusion_sigma_t=self.diffusion_sigma_t,
-                diffusion_sigma_l=self.diffusion_sigma_l,
-                attenuation_coeff=self.attenuation_coeff,
                 differentiable=False
             )
             projections[plane_id] = projection
@@ -217,8 +202,6 @@ class LArTPCReconstructor:
         if self.debug:
             start_time = time.time()
             print(f"Differentiable projection of sparse volume from {coords.shape[0]} non-zero voxels...")
-            if self.enable_diffusion:
-                print(f"  Applying electron diffusion effects (sigma_t={self.diffusion_sigma_t}, sigma_l={self.diffusion_sigma_l})")
         
         # Move to the device if needed
         if coords.device.type != self.device:
@@ -247,10 +230,6 @@ class LArTPCReconstructor:
                 u_min=u_min, 
                 device=self.device, 
                 projection_size=projection_size,
-                enable_diffusion=self.enable_diffusion,
-                diffusion_sigma_t=self.diffusion_sigma_t,
-                diffusion_sigma_l=self.diffusion_sigma_l,
-                attenuation_coeff=self.attenuation_coeff,
                 differentiable=True
             )
             projections[plane_id] = projection
@@ -267,14 +246,13 @@ class LArTPCReconstructor:
         
         return projections
     
-    def reconstruct_from_projections(self, projections, threshold=0.1, fast_merge=True, snap_to_grid=True):
+    def reconstruct_from_projections(self, projections, threshold=0.1, snap_to_grid=True):
         """
         Reconstruct 3D points from 2D projections.
         
         Args:
             projections (dict): Dictionary mapping plane_id to projection data
             threshold (float): Threshold for considering a hit in the projections
-            fast_merge (bool): Whether to use fast merge mode (much faster but slightly less precise)
             snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
         Returns:
@@ -283,10 +261,6 @@ class LArTPCReconstructor:
         if self.debug:
             start_time = time.time()
             print(f"Reconstructing 3D points from {len(projections)} projections (threshold={threshold})...")
-            if fast_merge:
-                print("Using FAST merge mode for maximum speed")
-            else:
-                print("Using PRECISE merge mode (slower but more accurate)")
             if snap_to_grid:
                 print("Snapping intersection points to nearest grid points")
         
@@ -314,7 +288,7 @@ class LArTPCReconstructor:
             print(f"  Solving inverse problem...")
         
         # Solve the inverse problem
-        reconstructed_points = self.solver.solve_inverse_problem(thresholded_projections, fast_merge=fast_merge, snap_to_grid=snap_to_grid)
+        reconstructed_points = self.solver.solve_inverse_problem(thresholded_projections, snap_to_grid=snap_to_grid)
         
         if self.debug:
             end_time = time.time()
@@ -323,7 +297,7 @@ class LArTPCReconstructor:
         
         return reconstructed_points
     
-    def reconstruct_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True, use_gaussian=True, snap_to_grid=True):
+    def reconstruct_volume(self, projections, threshold=0.1, voxel_size=1.0, use_gaussian=True, snap_to_grid=True):
         """
         Reconstruct a 3D volume from 2D projections by placing voxels at intersection points.
         
@@ -331,7 +305,6 @@ class LArTPCReconstructor:
             projections (dict): Dictionary mapping plane_id to projection data
             threshold (float): Threshold for considering a hit in the projections
             voxel_size (float): Size of the voxels to place at intersection points
-            fast_merge (bool): Whether to use fast merge mode for clustering
             use_gaussian (bool): Whether to place Gaussian blobs at each point (True) or just single voxels (False)
             snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
@@ -346,7 +319,7 @@ class LArTPCReconstructor:
                 print(f"  Snapping intersection points to nearest grid points")
         
         # Reconstruct 3D points
-        points = self.reconstruct_from_projections(projections, threshold, fast_merge, snap_to_grid)
+        points = self.reconstruct_from_projections(projections, threshold, snap_to_grid)
         
         if self.debug:
             points_time = time.time()
@@ -461,7 +434,7 @@ class LArTPCReconstructor:
         
         return volume
     
-    def reconstruct_sparse_volume(self, projections, threshold=0.1, voxel_size=1.0, fast_merge=True, use_gaussian=False, snap_to_grid=True):
+    def reconstruct_sparse_volume(self, projections, threshold=0.1, voxel_size=1.0, use_gaussian=False, snap_to_grid=True):
         """
         Reconstruct a sparse 3D volume from 2D projections by placing voxels at intersection points.
         Uses vectorized operations for better performance.
@@ -470,7 +443,6 @@ class LArTPCReconstructor:
             projections (dict): Dictionary mapping plane_id to projection data
             threshold (float): Threshold for considering a hit in the projections
             voxel_size (float): Size of the voxels to place at intersection points
-            fast_merge (bool): Whether to use fast merge mode for clustering
             use_gaussian (bool): Whether to place Gaussian blobs at each point (True) or just single voxels (False)
             snap_to_grid (bool): Whether to snap intersection points to the nearest grid points
             
@@ -485,7 +457,7 @@ class LArTPCReconstructor:
                 print(f"  Snapping intersection points to nearest grid points")
         
         # Reconstruct 3D points
-        points = self.reconstruct_from_projections(projections, threshold, fast_merge, snap_to_grid)
+        points = self.reconstruct_from_projections(projections, threshold, snap_to_grid)
         
         if self.debug:
             points_time = time.time()
@@ -568,7 +540,6 @@ class LArTPCReconstructor:
             print(f"  Computed voxel indices in {indices_time - points_time:.2f} seconds")
             print(f"  Creating Gaussian blobs in parallel (radius={radius})...")
         
-        # Instead of looping through points, use a vectorized approach to create all potential voxel coordinates
         # First, create offsets for Gaussian blobs
         r = radius
         offsets = []
@@ -744,8 +715,8 @@ class LArTPCReconstructor:
         psnr = 20 * math.log10(max_val / max(1e-8, math.sqrt(mse)))
         
         # PSNR only on non-zero pixels of the target image
-        # Create a mask for non-zero pixels in the original volume
-        non_zero_mask = original_volume > 0
+        # Create a mask for non-zero pixels in the original volume or reconstructed volume
+        non_zero_mask = (reconstructed_volume > 0) | (original_volume > 0)
         
         # If there are any non-zero pixels, compute PSNR only on those
         if torch.any(non_zero_mask):
@@ -1230,27 +1201,3 @@ class LArTPCReconstructor:
             ])
         
         return directions
-
-    def set_diffusion_parameters(self, enable_diffusion=True, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, attenuation_coeff=0.0):
-        """
-        Set the parameters for electron diffusion and attenuation simulation.
-        
-        Args:
-            enable_diffusion (bool): Whether to enable electron diffusion effects
-            diffusion_sigma_t (float): Transverse diffusion coefficient (perpendicular to drift)
-            diffusion_sigma_l (float): Longitudinal diffusion coefficient (along drift direction)
-            attenuation_coeff (float): Electron attenuation coefficient due to impurities
-        """
-        self.enable_diffusion = enable_diffusion
-        self.diffusion_sigma_t = diffusion_sigma_t
-        self.diffusion_sigma_l = diffusion_sigma_l
-        self.attenuation_coeff = attenuation_coeff
-        
-        if self.debug:
-            if enable_diffusion:
-                print(f"Diffusion enabled with parameters:")
-                print(f"  Transverse diffusion sigma: {diffusion_sigma_t}")
-                print(f"  Longitudinal diffusion sigma: {diffusion_sigma_l}")
-                print(f"  Attenuation coefficient: {attenuation_coeff}")
-            else:
-                print("Diffusion effects disabled") 

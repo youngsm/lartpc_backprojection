@@ -228,7 +228,7 @@ class LineIntersectionSolver:
         
         return points, directions, plane_ids
     
-    def find_intersections(self, projections, fast_merge=True, snap_to_grid=True):
+    def find_intersections(self, projections, snap_to_grid=True):
         """
         Find intersections between backprojected lines from multiple wire planes.
         
@@ -347,7 +347,6 @@ class LineIntersectionSolver:
                 all_distances,
                 self.merge_tolerance,
                 debug=self.debug,
-                fast_mode=fast_merge
             )
             
             if self.debug:
@@ -367,7 +366,7 @@ class LineIntersectionSolver:
             
             return torch.zeros((0, 3), device=self.device)
 
-    def solve_inverse_problem(self, projections, fast_merge=True, snap_to_grid=True):
+    def solve_inverse_problem(self, projections, snap_to_grid=True):
         """
         Solve the inverse problem: find 3D points that are consistent with
         intersections of backprojected lines from different wire planes.
@@ -383,15 +382,11 @@ class LineIntersectionSolver:
         if self.debug:
             start_time = time.time()
             print("Solving inverse problem...")
-            if fast_merge:
-                print("  Using FAST merge mode for maximum speed")
-            else:
-                print("  Using PRECISE merge mode (slower but more accurate)")
             if snap_to_grid:
                 print("  Snapping intersection points to nearest grid points")
         
         # Find intersections between backprojected lines
-        intersection_points = self.find_intersections(projections, fast_merge, snap_to_grid)
+        intersection_points = self.find_intersections(projections, snap_to_grid)
         
         # Filter out points outside the volume bounds
         if intersection_points.size(0) > 0:

@@ -5,7 +5,7 @@ from .cuda_kernels import (
     find_intersections_cuda,
     merge_nearby_intersections_cuda,
     backproject_hits_cuda,
-    project_volume_cuda
+    project_sparse_volume
 )
 from .intersection_solver import LineIntersectionSolver
 from .reconstructor import LArTPCReconstructor
@@ -16,15 +16,6 @@ from .visualization import (
     visualize_original_vs_reconstructed
 )
 
-# Raw CUDA kernels using Numba
-try:
-    from .cuda_raw_kernels import (
-        backproject_hits_cuda_raw,
-        find_line_intersections_cuda_raw
-    )
-except ImportError:
-    # Numba might not be available
-    pass
 
 __all__ = [
     'Line3D',
@@ -35,11 +26,9 @@ __all__ = [
     'find_intersections_cuda',
     'merge_nearby_intersections_cuda',
     'backproject_hits_cuda',
-    'project_volume_cuda',
+    'project_sparse_volume',
     'LineIntersectionSolver',
     'LArTPCReconstructor',
-    'backproject_hits_cuda_raw',
-    'find_line_intersections_cuda_raw',
     'visualize_volume',
     'visualize_projections',
     'visualize_lines_and_intersections',

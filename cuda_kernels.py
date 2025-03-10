@@ -190,7 +190,7 @@ def find_intersections_cuda(
     return intersection_points, line_indices1, line_indices2, valid_distances
 
 
-def merge_nearby_intersections_cuda(intersection_points, distances, tolerance=1.0, batch_size=10000, debug=False, fast_mode=True):
+def merge_nearby_intersections_cuda(intersection_points, distances, tolerance=1.0, batch_size=10000, debug=False):
     """
     Merge intersection points that are very close to each other, using a memory-efficient approach.
     
@@ -215,20 +215,7 @@ def merge_nearby_intersections_cuda(intersection_points, distances, tolerance=1.
             print("  No intersection points to merge.")
         return torch.zeros((0, 3), device=intersection_points.device)
     
-    # Choose the appropriate method based on size and mode
-    if fast_mode and intersection_points.size(0) > 100:
-        if debug:
-            print(f"  Using fully vectorized approach for {intersection_points.shape[0]} points...")
-        result = _merge_nearby_intersections_fast(intersection_points, distances, tolerance, debug)
-    elif intersection_points.size(0) <= batch_size:
-        if debug:
-            print(f"  Using simple pairwise approach for {intersection_points.shape[0]} points...")
-        result = _merge_nearby_intersections_small(intersection_points, distances, tolerance, debug)
-    else:
-        # For large sets of points, use a voxel-grid based approach
-        if debug:
-            print(f"  Using voxel grid approach for {intersection_points.shape[0]} points...")
-        result = _merge_nearby_intersections_voxel_grid(intersection_points, distances, tolerance, debug)
+    result = _merge_nearby_intersections(intersection_points, distances, tolerance, debug)
     
     if debug:
         end_time = time.time()
@@ -238,250 +225,7 @@ def merge_nearby_intersections_cuda(intersection_points, distances, tolerance=1.
     return result
 
 
-def _merge_nearby_intersections_small(intersection_points, distances, tolerance=1.0, debug=False):
-    """
-    Merge nearby intersection points for small datasets using pairwise distances.
-    
-    Args:
-        intersection_points (torch.Tensor): Intersection points (N, 3)
-        distances (torch.Tensor): Distances between the lines (N)
-        tolerance (float): Tolerance for merging
-        debug (bool): Whether to print debug information
-        
-    Returns:
-        torch.Tensor: Merged intersection points
-    """
-    device = intersection_points.device
-    n = intersection_points.size(0)
-    
-    if debug:
-        stage_time = time.time()
-    
-    # Initialize cluster assignments
-    cluster_assignments = torch.arange(n, device=device)
-    
-    if debug:
-        init_time = time.time()
-        print(f"    Initialized cluster assignments in {init_time - stage_time:.2f} seconds")
-    
-    # Compute pairwise distances between all intersection points
-    pairwise_distances = torch.cdist(intersection_points, intersection_points)
-    
-    if debug:
-        cdist_time = time.time()
-        print(f"    Computed pairwise distances in {cdist_time - init_time:.2f} seconds")
-        print(f"    Pairwise distance matrix shape: {pairwise_distances.shape}")
-    
-    # Find pairs that are closer than tolerance
-    close_pairs = torch.nonzero(pairwise_distances <= tolerance, as_tuple=True)
-    
-    if debug:
-        pairs_time = time.time()
-        print(f"    Found {len(close_pairs[0])} close pairs in {pairs_time - cdist_time:.2f} seconds")
-    
-    # For each close pair, assign both points to the smaller cluster index
-    for i, j in zip(*close_pairs):
-        if i != j:
-            old_cluster = torch.max(cluster_assignments[i], cluster_assignments[j])
-            new_cluster = torch.min(cluster_assignments[i], cluster_assignments[j])
-            cluster_assignments = torch.where(cluster_assignments == old_cluster, new_cluster, cluster_assignments)
-    
-    if debug:
-        cluster_time = time.time()
-        print(f"    Assigned clusters in {cluster_time - pairs_time:.2f} seconds")
-    
-    # Count unique clusters
-    unique_clusters = torch.unique(cluster_assignments)
-    num_clusters = unique_clusters.size(0)
-    
-    # Initialize merged points tensor
-    merged_points = torch.zeros((num_clusters, 3), device=device)
-    
-    # For each cluster, compute the weighted average of its points
-    # Points with smaller distances (better intersections) have higher weights
-    for i, cluster in enumerate(unique_clusters):
-        mask = cluster_assignments == cluster
-        cluster_points = intersection_points[mask]
-        cluster_distances = distances[mask]
-        
-        # Use inverse distances as weights
-        weights = 1.0 / (cluster_distances + 1e-10)
-        weights = weights / torch.sum(weights)
-        
-        # Compute weighted average
-        weighted_points = cluster_points * weights.unsqueeze(1)
-        merged_points[i] = torch.sum(weighted_points, dim=0)
-    
-    if debug:
-        avg_time = time.time()
-        print(f"    Computed weighted averages in {avg_time - cluster_time:.2f} seconds")
-    
-    return merged_points
-
-
-def _merge_nearby_intersections_voxel_grid(intersection_points, distances, tolerance=1.0, debug=False):
-    """
-    Memory-efficient approach to merge nearby intersection points using a voxel grid.
-    
-    Args:
-        intersection_points (torch.Tensor): Intersection points (N, 3)
-        distances (torch.Tensor): Distances between the lines (N)
-        tolerance (float): Tolerance for merging
-        debug (bool): Whether to print debug information
-        
-    Returns:
-        torch.Tensor: Merged intersection points
-    """
-    device = intersection_points.device
-    n = intersection_points.size(0)
-    
-    if debug:
-        stage_time = time.time()
-    
-    # Scale factor to convert world coordinates to voxel grid coordinates
-    # Choose voxel size to be slightly smaller than tolerance to ensure points 
-    # within tolerance will be in the same or adjacent voxels
-    voxel_size = tolerance * 0.75  
-    
-    # Get bounds of the points
-    min_coords, _ = torch.min(intersection_points, dim=0)
-    max_coords, _ = torch.max(intersection_points, dim=0)
-    
-    # Add padding to ensure all points are inside
-    min_coords = min_coords - voxel_size
-    max_coords = max_coords + voxel_size
-    
-    if debug:
-        bounds_time = time.time()
-        print(f"    Computed point bounds in {bounds_time - stage_time:.2f} seconds")
-        print(f"    Bounds: min={min_coords.cpu().numpy()}, max={max_coords.cpu().numpy()}")
-        print(f"    Using voxel size: {voxel_size}")
-    
-    # Convert points to voxel grid indices
-    voxel_indices = torch.floor((intersection_points - min_coords) / voxel_size).long()
-    
-    # Create a unique hash for each voxel
-    # Use a prime-based hash to reduce collisions
-    prime_multipliers = torch.tensor([73856093, 19349663, 83492791], device=device)
-    voxel_hash = torch.sum(voxel_indices * prime_multipliers, dim=1)
-    
-    if debug:
-        hash_time = time.time()
-        print(f"    Computed voxel hashes in {hash_time - bounds_time:.2f} seconds")
-    
-    # Find unique voxels and which points belong to each
-    unique_hashes, inverse_indices = torch.unique(voxel_hash, return_inverse=True)
-    
-    # Create a cluster for each unique voxel
-    # For each voxel, find all points in that voxel and compute weighted average
-    num_clusters = unique_hashes.size(0)
-    merged_points = torch.zeros((num_clusters, 3), device=device)
-    
-    if debug:
-        unique_time = time.time()
-        print(f"    Found {num_clusters} unique voxels in {unique_time - hash_time:.2f} seconds")
-    
-    # Mapping from hash to merged points index
-    hash_to_idx = {}
-    for i, h in enumerate(unique_hashes):
-        hash_to_idx[h.item()] = i
-    
-    # Process each voxel
-    for i, voxel_hash_val in enumerate(unique_hashes):
-        # Find points in this voxel
-        mask = voxel_hash == voxel_hash_val
-        voxel_points = intersection_points[mask]
-        voxel_distances = distances[mask]
-        
-        # Use inverse distances as weights
-        weights = 1.0 / (voxel_distances + 1e-10)
-        weights = weights / torch.sum(weights)
-        
-        # Compute weighted average for this voxel
-        merged_points[i] = torch.sum(voxel_points * weights.unsqueeze(1), dim=0)
-    
-    if debug:
-        voxel_avg_time = time.time()
-        print(f"    Computed voxel averages in {voxel_avg_time - unique_time:.2f} seconds")
-    
-    # Perform a second pass to merge adjacent voxels
-    # For each merged point, check if there are nearby merged points in adjacent voxels
-    # Note: This is much more efficient than checking all pairs because we only need to 
-    # check a small number of adjacent voxels
-    
-    # Convert merged points to voxel indices
-    merged_voxel_indices = torch.floor((merged_points - min_coords) / voxel_size).long()
-    
-    # Create a unique hash for each merged voxel
-    merged_voxel_hash = torch.sum(merged_voxel_indices * prime_multipliers, dim=1)
-    
-    # Initialize cluster assignments for merged points
-    final_cluster_assignments = torch.arange(num_clusters, device=device)
-    
-    if debug:
-        init_adj_time = time.time()
-        print(f"    Initialized adjacent voxel check in {init_adj_time - voxel_avg_time:.2f} seconds")
-        adjacent_checks = 0
-        total_points = num_clusters
-    
-    # For each merged point, check points in adjacent voxels
-    for i in range(num_clusters):
-        point = merged_points[i]
-        
-        # Get neighboring voxel indices (27 adjacent voxels including the current one)
-        vi = merged_voxel_indices[i]
-        
-        # For each merged point, check if it's close enough to the current point
-        # We don't need to check all points, only those that could be within tolerance
-        for j in range(i+1, num_clusters):
-            # Check if it's a potential neighbor (Manhattan distance ≤ 2 voxels)
-            vj = merged_voxel_indices[j]
-            if torch.max(torch.abs(vj - vi)) > 2:
-                continue
-                
-            if debug:
-                adjacent_checks += 1
-                
-            # Calculate actual distance between the points
-            other_point = merged_points[j]
-            dist = torch.norm(point - other_point)
-            
-            # If they're close enough, mark them as part of the same cluster
-            if dist <= tolerance:
-                # Assign both to the smaller cluster ID
-                old_cluster = torch.max(final_cluster_assignments[i], final_cluster_assignments[j])
-                new_cluster = torch.min(final_cluster_assignments[i], final_cluster_assignments[j])
-                final_cluster_assignments = torch.where(
-                    final_cluster_assignments == old_cluster, 
-                    new_cluster, 
-                    final_cluster_assignments
-                )
-    
-    if debug:
-        adj_check_time = time.time()
-        print(f"    Performed {adjacent_checks} adjacent voxel checks out of {total_points*(total_points-1)//2} possible pairs")
-        print(f"    Completed adjacent voxel checks in {adj_check_time - init_adj_time:.2f} seconds")
-    
-    # Get unique final clusters
-    unique_final_clusters = torch.unique(final_cluster_assignments)
-    num_final_clusters = unique_final_clusters.size(0)
-    
-    # Create final merged points
-    final_merged_points = torch.zeros((num_final_clusters, 3), device=device)
-    
-    # Compute the average position for each final cluster
-    for i, cluster in enumerate(unique_final_clusters):
-        mask = final_cluster_assignments == cluster
-        final_merged_points[i] = torch.mean(merged_points[mask], dim=0)
-    
-    if debug:
-        final_time = time.time()
-        print(f"    Created {num_final_clusters} final clusters in {final_time - adj_check_time:.2f} seconds")
-    
-    return final_merged_points
-
-
-def _merge_nearby_intersections_fast(
+def _merge_nearby_intersections(
     intersection_points, distances, tolerance=1.0, debug=False
 ):
     """
@@ -716,9 +460,7 @@ def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="c
     return points, directions, plane_ids
 
 
-def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None,
-                         enable_diffusion=False, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, 
-                         attenuation_coeff=0.0, differentiable=False):
+def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None, differentiable=False):
     """
     Unified function to project a sparse 3D volume to a 2D plane with optional diffusion effects.
     Supports both standard and differentiable projection modes.
@@ -731,10 +473,6 @@ def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cu
         u_min (float): Minimum u-coordinate
         device (str): Device to use for computation
         projection_size (tuple, optional): Size of the projection (x_size, u_size)
-        enable_diffusion (bool): Whether to enable electron diffusion effects
-        diffusion_sigma_t (float): Transverse diffusion coefficient (perpendicular to drift)
-        diffusion_sigma_l (float): Longitudinal diffusion coefficient (along drift direction)
-        attenuation_coeff (float): Electron attenuation coefficient due to impurities
         differentiable (bool): Whether to use differentiable projection mode
         
     Returns:
@@ -776,31 +514,6 @@ def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cu
     sin_theta = torch.sin(torch.tensor(theta, device=device))
     cos_theta = torch.cos(torch.tensor(theta, device=device))
     
-    # Apply electron diffusion and attenuation if enabled
-    if enable_diffusion:
-        # Make a copy of values to avoid modifying original
-        modified_values = sorted_values.clone()
-        
-        # Drift distance from each point to X=0 (anode)
-        # In LArTPC, electrons drift along X-axis to X=0
-        drift_distances = sorted_coords[:, 0].float()
-        
-        # Apply attenuation based on drift distance if coefficient > 0
-        if attenuation_coeff > 0:
-            attenuation_factor = torch.exp(-attenuation_coeff * drift_distances)
-            modified_values = modified_values * attenuation_factor
-        
-        # Calculate diffusion sigma for each point based on drift distance
-        # Diffusion increases with sqrt of drift distance
-        sigma_t = diffusion_sigma_t * torch.sqrt(drift_distances)
-        sigma_l = diffusion_sigma_l * torch.sqrt(drift_distances)
-        
-        # Proceed with modified values and apply diffusion in the projection space
-        sorted_values = modified_values
-    else:
-        # Use original values if diffusion is disabled
-        modified_values = sorted_values
-    
     # Calculate u coordinates for each point
     u_coords = -sorted_coords[:, 1] * sin_theta + sorted_coords[:, 2] * cos_theta - u_min
     
@@ -830,7 +543,9 @@ def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cu
         # Lower u contribution
         if valid_mask_lower.any():
             indices_lower = torch.stack([x_indices[valid_mask_lower], u_lower[valid_mask_lower]], dim=0)
-            values_lower = modified_values[valid_mask_lower] * u_weight_lower[valid_mask_lower]
+            values_lower = (
+                sorted_values[valid_mask_lower] * u_weight_lower[valid_mask_lower]
+            )
             lower_contribution = torch.sparse_coo_tensor(
                 indices_lower, 
                 values_lower,
@@ -848,7 +563,9 @@ def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cu
         # Upper u contribution
         if valid_mask_upper.any():
             indices_upper = torch.stack([x_indices[valid_mask_upper], u_upper[valid_mask_upper]], dim=0)
-            values_upper = modified_values[valid_mask_upper] * u_weight_upper[valid_mask_upper]
+            values_upper = (
+                sorted_values[valid_mask_upper] * u_weight_upper[valid_mask_upper]
+            )
             upper_contribution = torch.sparse_coo_tensor(
                 indices_upper, 
                 values_upper,
@@ -876,55 +593,11 @@ def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cu
         
         # Create a sparse tensor and convert to dense
         sparse_projection = torch.sparse_coo_tensor(
-            indices=indices,
-            values=modified_values,
-            size=(x_size, u_size),
-            device=device
+            indices=indices, values=sorted_values, size=(x_size, u_size), device=device
         )
         
         # Convert to dense tensor
         projection = sparse_projection.to_dense()
-    
-    # Apply transverse diffusion effect by convolving with Gaussian kernel if enabled
-    if enable_diffusion:
-        # Create a set of 1D Gaussian kernels based on the diffusion sigmas
-        # We need to create a kernel for each x-position since diffusion varies with drift distance
-        
-        # For efficiency, we'll use a simpler approach - a single Gaussian blur based on average sigma
-        # In a real implementation, you might want a more precise approach with position-dependent kernels
-        
-        # Compute average sigma for transverse diffusion
-        if len(drift_distances) > 0:
-            avg_sigma_t = (diffusion_sigma_t * torch.sqrt(drift_distances.mean())).item()
-        else:
-            avg_sigma_t = diffusion_sigma_t
-            
-        # Create Gaussian kernel for convolution
-        kernel_size = max(3, int(6 * avg_sigma_t))  # Ensure kernel covers at least 3σ on each side
-        if kernel_size % 2 == 0:  # Ensure odd kernel size for symmetric convolution
-            kernel_size += 1
-            
-        # Create 1D Gaussian kernel
-        kernel_range = torch.arange(kernel_size, device=device) - (kernel_size // 2)
-        kernel = torch.exp(-(kernel_range ** 2) / (2 * avg_sigma_t ** 2))
-        kernel = kernel / kernel.sum()  # Normalize
-        
-        # Reshape kernel for 2D convolution (1xkernel_size)
-        kernel_y = kernel.view(1, 1, 1, -1)
-        
-        # Apply convolution in y dimension only (transverse diffusion)
-        # First reshape projection for convolution
-        projection_reshaped = projection.view(1, 1, *projection.shape)
-        
-        # Pad the projection for convolution
-        pad_size = kernel_size // 2
-        padded_projection = torch.nn.functional.pad(projection_reshaped, (pad_size, pad_size, 0, 0), mode='replicate')
-        
-        # Apply convolution
-        diffused_projection = torch.nn.functional.conv2d(padded_projection, kernel_y.to(device))
-        
-        # Extract the result
-        projection = diffused_projection.view(*projection.shape)
     
     return projection
 
