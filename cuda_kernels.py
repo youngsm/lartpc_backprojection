@@ -481,143 +481,174 @@ def _merge_nearby_intersections_voxel_grid(intersection_points, distances, toler
     return final_merged_points
 
 
-def _merge_nearby_intersections_fast(intersection_points, distances, tolerance=1.0, debug=False):
+def _merge_nearby_intersections_fast(
+    intersection_points, distances, tolerance=1.0, debug=False
+):
     """
     A highly optimized, fully vectorized approach to merge nearby intersection points.
     Uses voxel-based clustering and vectorized operations to avoid loops.
-    
+
     Args:
         intersection_points (torch.Tensor): Intersection points (N, 3)
         distances (torch.Tensor): Distances between the lines (N)
         tolerance (float): Tolerance for merging
         debug (bool): Whether to print debug information
-        
+
     Returns:
         torch.Tensor: Merged intersection points
     """
     device = intersection_points.device
     n = intersection_points.size(0)
-    
+
     if debug:
         stage_time = time.time()
-    
+
     # 1. First, use a voxel grid to cluster points that are definitely close
     # Choose voxel size to be slightly smaller than tolerance
     voxel_size = tolerance * 0.5
-    
+
     # Get min and max coordinates to define the voxel grid
     min_coords, _ = torch.min(intersection_points, dim=0)
     max_coords, _ = torch.max(intersection_points, dim=0)
-    
+
     # Add padding to ensure all points are inside
     min_coords = min_coords - voxel_size
     max_coords = max_coords + voxel_size
-    
+
     if debug:
         bounds_time = time.time()
         print(f"    Computed point bounds in {bounds_time - stage_time:.2f} seconds")
-    
+
     # Convert points to voxel grid indices
     # Scale and quantize the points to voxel indices
     voxel_indices = torch.floor((intersection_points - min_coords) / voxel_size).long()
-    
-    # Create a unique hash for each voxel
-    # Use Morton code or another space-filling curve for better cache locality
-    # But a simple linear index works well too
+
+    # Determine maximum bits needed for each dimension
     grid_size = torch.floor((max_coords - min_coords) / voxel_size).long() + 1
-    voxel_hash = (
-        voxel_indices[:, 0] * grid_size[1] * grid_size[2] +
-        voxel_indices[:, 1] * grid_size[2] +
-        voxel_indices[:, 2]
-    )
-    
+    max_bits = torch.ceil(torch.log2(grid_size.float())).int().max().item()
+    bits_per_dim = min(
+        10, max_bits
+    )  # Limit to 10 bits per dimension (30 bits total fits in int32)
+    max_voxels_per_dim = 2**bits_per_dim
+
+    # Clamp indices to valid range
+    voxel_indices = torch.clamp(voxel_indices, 0, max_voxels_per_dim - 1)
+
+    # Compute Morton codes directly on GPU using bit operations
+    # Faster implementation that works directly on the GPU
+    def split_bits_gpu(x):
+        # This is a vectorized version that works on GPU tensors
+        # Avoid unnecessary transfers between CPU and GPU
+        x = x & 0x3FF  # Limit to 10 bits
+        x = (x | (x << 16)) & 0x30000FF
+        x = (x | (x << 8)) & 0x300F00F
+        x = (x | (x << 4)) & 0x30C30C3
+        x = (x | (x << 2)) & 0x9249249
+        return x
+
+    # Compute Morton code for each voxel directly on the GPU
+    x_bits = split_bits_gpu(voxel_indices[:, 0])
+    y_bits = split_bits_gpu(voxel_indices[:, 1])
+    z_bits = split_bits_gpu(voxel_indices[:, 2])
+
+    voxel_hash = x_bits | (y_bits << 1) | (z_bits << 2)
+
     if debug:
         hash_time = time.time()
-        print(f"    Computed voxel hashes in {hash_time - bounds_time:.2f} seconds")
-    
+        print(f"    Computed Morton codes in {hash_time - bounds_time:.2f} seconds")
+
     # Get unique voxels and the inverse mapping to original points
     unique_voxels, inverse_indices = torch.unique(voxel_hash, return_inverse=True)
     num_voxels = unique_voxels.size(0)
-    
+
     if debug:
         unique_time = time.time()
-        print(f"    Found {num_voxels} unique voxels in {unique_time - hash_time:.2f} seconds")
-    
+        print(
+            f"    Found {num_voxels} unique voxels in {unique_time - hash_time:.2f} seconds"
+        )
+
     # 2. Compute weighted average for each voxel (initial clustering)
     # For each unique voxel, calculate the weighted average of all points in that voxel
-    
+
     # We need to compute: sum(points[i] * weights[i]) / sum(weights[i]) for each voxel
     # This can be done using torch.scatter_add in a vectorized way
-    
+
     # Create weights based on inverse distances
     weights = 1.0 / (distances + 1e-10)
-    
+
     # Create tensors to accumulate weighted sums and weight sums
     weighted_sums = torch.zeros((num_voxels, 3), device=device)
     weight_sums = torch.zeros(num_voxels, device=device)
-    
+
     # Use scatter_add to accumulate values for each voxel
     for dim in range(3):
         weighted_values = intersection_points[:, dim] * weights
         weighted_sums[:, dim].scatter_add_(0, inverse_indices, weighted_values)
-    
+
     # Accumulate weights for normalization
     weight_sums.scatter_add_(0, inverse_indices, weights)
-    
+
     # Normalize to get weighted averages
     voxel_centers = weighted_sums / weight_sums.unsqueeze(1)
-    
+
     if debug:
         avg_time = time.time()
-        print(f"    Computed initial voxel centers in {avg_time - unique_time:.2f} seconds")
-    
+        print(
+            f"    Computed initial voxel centers in {avg_time - unique_time:.2f} seconds"
+        )
+
     # 3. Second-level clustering to merge nearby voxels
     # For voxels that are close to each other, merge them
-    
+
     # Create a new set of voxel indices based on the voxel centers
     voxel_indices_2 = torch.floor((voxel_centers - min_coords) / tolerance).long()
-    
-    # Create a unique hash for each new voxel
-    fine_grid_size = torch.floor((max_coords - min_coords) / tolerance).long() + 1
-    voxel_hash_2 = (
-        voxel_indices_2[:, 0] * fine_grid_size[1] * fine_grid_size[2] +
-        voxel_indices_2[:, 1] * fine_grid_size[2] +
-        voxel_indices_2[:, 2]
-    )
-    
+
+    # Clamp indices for second-level clustering
+    voxel_indices_2 = torch.clamp(voxel_indices_2, 0, max_voxels_per_dim - 1)
+
+    # Compute Morton codes for second-level clustering directly on GPU
+    x_bits_2 = split_bits_gpu(voxel_indices_2[:, 0])
+    y_bits_2 = split_bits_gpu(voxel_indices_2[:, 1])
+    z_bits_2 = split_bits_gpu(voxel_indices_2[:, 2])
+
+    voxel_hash_2 = x_bits_2 | (y_bits_2 << 1) | (z_bits_2 << 2)
+
     # Get unique voxels in this new grid
     unique_voxels_2, inverse_indices_2 = torch.unique(voxel_hash_2, return_inverse=True)
     num_voxels_2 = unique_voxels_2.size(0)
-    
+
     if debug:
         voxel2_time = time.time()
-        print(f"    Found {num_voxels_2} second-level voxels in {voxel2_time - avg_time:.2f} seconds")
-    
+        print(
+            f"    Found {num_voxels_2} second-level voxels in {voxel2_time - avg_time:.2f} seconds"
+        )
+
     # Compute the new cluster centers
     # We need to compute weighted averages again, but now using the voxel centers as points
     # and the total weight of each voxel as the weight
-    
+
     # Create tensors to accumulate weighted sums and weight sums
     weighted_sums_2 = torch.zeros((num_voxels_2, 3), device=device)
     weight_sums_2 = torch.zeros(num_voxels_2, device=device)
-    
+
     # Use scatter_add to accumulate values for each final voxel
     for dim in range(3):
         weighted_values_2 = voxel_centers[:, dim] * weight_sums
         weighted_sums_2[:, dim].scatter_add_(0, inverse_indices_2, weighted_values_2)
-    
+
     # Accumulate total weights
     weight_sums_2.scatter_add_(0, inverse_indices_2, weight_sums)
-    
+
     # Normalize to get final cluster centers
     final_centers = weighted_sums_2 / weight_sums_2.unsqueeze(1)
-    
+
     if debug:
         final_time = time.time()
-        print(f"    Computed final {final_centers.shape[0]} cluster centers in {final_time - voxel2_time:.2f} seconds")
-    
-    return final_centers
+        print(
+            f"    Computed final {final_centers.shape[0]} cluster centers in {final_time - voxel2_time:.2f} seconds"
+        )
 
+    return final_centers
 
 def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="cuda", plane_id=None):
     """
@@ -685,239 +716,12 @@ def backproject_hits_cuda(projection_data, theta, u_min, volume_shape, device="c
     return points, directions, plane_ids
 
 
-def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None):
+def project_sparse_volume(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None,
+                         enable_diffusion=False, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, 
+                         attenuation_coeff=0.0, differentiable=False):
     """
-    Project a sparse 3D volume to a 2D projection using CUDA.
-    Much more efficient for sparse volumes.
-    
-    Args:
-        coords (torch.Tensor): Coordinates of non-zero voxels (N, 3)
-        values (torch.Tensor): Values of non-zero voxels (N)
-        volume_shape (tuple): Shape of the 3D volume (depth, height, width)
-        theta (float): Angle of the wire plane in radians
-        u_min (float): Minimum u-coordinate
-        device (str): Device to use ('cuda' or 'cpu')
-        projection_size (tuple): Optional. Size of the output projection (depth, width). 
-                                If None, the size is determined dynamically.
-        
-    Returns:
-        torch.Tensor: 2D projection of shape (depth, U) where U depends on the projection or projection_size
-    """
-    if coords.shape[0] == 0:  # Empty volume
-        if projection_size is not None:
-            return torch.zeros(projection_size, device=device)
-        return torch.zeros((volume_shape[0], 1), device=device)
-    
-    # Get volume shape
-    N = volume_shape[0]
-    
-    # Extract coordinates
-    x = coords[:, 0].long()
-    y = coords[:, 1]
-    z = coords[:, 2]
-    
-    # Compute u-coordinates
-    sin_theta = math.sin(theta)
-    cos_theta = math.cos(theta)
-    u = torch.round(-sin_theta * y + cos_theta * z) - u_min
-    u = u.long()
-    
-    # Determine the size of the projection
-    if projection_size is not None:
-        # Use standardized size
-        _, u_max = projection_size
-    else:
-        # Use dynamic size based on points
-        u_max = int(torch.max(u).item()) + 1
-    
-    # Create 2D indices for the sparse tensor
-    indices = torch.stack([x, u], dim=0)
-    
-    # Create a sparse tensor and convert to dense
-    sparse_projection = torch.sparse_coo_tensor(
-        indices=indices,
-        values=values,
-        size=(N, u_max),
-        device=device
-    )
-    
-    # Convert to dense tensor
-    projection = sparse_projection.to_dense()
-    
-    return projection
-
-
-def project_volume_cuda(volume, theta, u_min, device='cuda', projection_size=None):
-    """
-    Project a 3D volume to a 2D projection using CUDA.
-    Automatically uses sparse implementation for efficiency if volume is sparse.
-    
-    Args:
-        volume (torch.Tensor): 3D volume of shape (N, N, N)
-        theta (float): Angle of the wire plane in radians
-        u_min (float): Minimum u-coordinate
-        device (str): Device to use ('cuda' or 'cpu')
-        projection_size (tuple): Optional. Size of the output projection (depth, width).
-                                If None, the size is determined dynamically.
-        
-    Returns:
-        torch.Tensor: 2D projection of shape (N, U) where U depends on the projection or projection_size
-    """
-    # If the volume is sparse (less than 1% non-zero), use sparse implementation
-    sparsity = (volume > 0).sum() / volume.numel()
-    
-    if sparsity < 0.01:
-        # Convert to sparse representation
-        non_zero_indices = torch.nonzero(volume, as_tuple=False)
-        non_zero_values = volume[non_zero_indices[:, 0], non_zero_indices[:, 1], non_zero_indices[:, 2]]
-        
-        # Use sparse projection
-        return project_volume_cuda_sparse(non_zero_indices, non_zero_values, volume.shape, theta, u_min, device, projection_size)
-    
-    # For denser volumes, use the original approach but more efficiently
-    # Get volume shape
-    N = volume.shape[0]
-    
-    # Find non-zero voxels for efficiency
-    non_zero = torch.nonzero(volume, as_tuple=True)
-    x_indices = non_zero[0]
-    y_indices = non_zero[1]
-    z_indices = non_zero[2]
-    values = volume[x_indices, y_indices, z_indices]
-    
-    # Compute u-coordinates
-    sin_theta = math.sin(theta)
-    cos_theta = math.cos(theta)
-    u_indices = torch.round(-sin_theta * y_indices.float() + cos_theta * z_indices.float()) - u_min
-    u_indices = u_indices.long()
-    
-    # Determine the size of the projection
-    if projection_size is not None:
-        # Use standardized size
-        _, u_max = projection_size
-    else:
-        # Use dynamic size based on points
-        u_max = int(torch.max(u_indices).item()) + 1
-    
-    # Create the projection tensor
-    projection = torch.zeros((N, u_max), device=device)
-    
-    # Use direct indexing for efficient accumulation
-    for i in range(len(values)):
-        x_idx = x_indices[i]
-        u_idx = u_indices[i]
-        projection[x_idx, u_idx] += values[i]
-    
-    return projection
-
-
-def project_volume_differentiable(volume, theta, u_min, device='cuda', projection_size=None):
-    """
-    Differentiable version of the volume projection operation.
-    Maintains gradients throughout the projection for backpropagation.
-    
-    Args:
-        volume (torch.Tensor): 3D volume of shape (N, N, N)
-        theta (float): Angle of the wire plane in radians
-        u_min (float): Minimum u-coordinate
-        device (str): Device to use ('cuda' or 'cpu')
-        projection_size (tuple): Optional. Size of the output projection (depth, width).
-                                If None, the size is determined dynamically.
-        
-    Returns:
-        torch.Tensor: 2D projection of shape (N, U) where U depends on the projection or projection_size
-    """
-    # Optimize by converting to sparse if the volume is sparse enough
-    sparsity = torch.count_nonzero(volume) / volume.numel()
-    if sparsity < 0.1:  # If less than 10% of voxels are non-zero, use sparse version
-        # Convert to sparse representation
-        coords = torch.nonzero(volume, as_tuple=False)
-        values = volume[coords[:, 0], coords[:, 1], coords[:, 2]]
-        return project_sparse_volume_differentiable(coords, values, volume.shape, theta, u_min, device, projection_size)
-    
-    # Get volume shape
-    N = volume.shape[0]
-    
-    # For non-sparse volumes, use a more memory-efficient approach
-    # We'll process the volume plane by plane to reduce memory usage
-    
-    # Create a tensor for the output projection
-    if projection_size is not None:
-        _, u_max = projection_size
-    else:
-        # Calculate maximum possible u value
-        max_y = N - 1
-        max_z = N - 1
-        sin_theta = torch.sin(torch.tensor(theta, device=device))
-        cos_theta = torch.cos(torch.tensor(theta, device=device))
-        max_u = -sin_theta * max_y + cos_theta * max_z - u_min
-        u_max = int(torch.ceil(max_u.item())) + 2
-    
-    projection = torch.zeros((N, u_max), device=device)
-    
-    # We'll process one x-slice at a time to save memory
-    for x in range(N):
-        # Get the x-slice of the volume
-        slice_2d = volume[x]
-        
-        # Skip if the entire slice is zeros
-        if not torch.any(slice_2d):
-            continue
-        
-        # Find non-zero positions in the slice
-        y_indices, z_indices = torch.nonzero(slice_2d, as_tuple=True)
-        values = slice_2d[y_indices, z_indices]
-        
-        # Convert to float for accurate calculations
-        y = y_indices.float()
-        z = z_indices.float()
-        
-        # Calculate u coordinates (without rounding for differentiability)
-        sin_theta = torch.sin(torch.tensor(theta, device=device))
-        cos_theta = torch.cos(torch.tensor(theta, device=device))
-        u_coords = -sin_theta * y + cos_theta * z - u_min
-        
-        # Calculate indices and fractions for bilinear interpolation
-        u_indices = torch.clamp(torch.floor(u_coords).long(), min=0, max=u_max-1)
-        u_frac = u_coords - u_indices.float()
-        u_indices_next = torch.clamp(u_indices + 1, max=u_max-1)
-        
-        # Calculate weights for bilinear interpolation
-        weight_current = (1.0 - u_frac) * values
-        weight_next = u_frac * values
-        
-        # Use sparse tensor operations for speed
-        indices_current = torch.stack([torch.zeros_like(u_indices) + x, u_indices], dim=1)
-        indices_next = torch.stack([torch.zeros_like(u_indices_next) + x, u_indices_next], dim=1)
-        
-        # Create and add sparse tensors
-        current_contribution = torch.sparse_coo_tensor(
-            indices=indices_current.t(),
-            values=weight_current,
-            size=(N, u_max),
-            device=device
-        )
-        
-        next_contribution = torch.sparse_coo_tensor(
-            indices=indices_next.t(),
-            values=weight_next,
-            size=(N, u_max),
-            device=device
-        )
-        
-        # Add to the projection
-        projection += current_contribution.to_dense()
-        projection += next_contribution.to_dense()
-    
-    return projection
-
-
-def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None,
-                                        enable_diffusion=False, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, 
-                                        attenuation_coeff=0.0):
-    """
-    Differentiable projection of a sparse volume to a 2D plane with optional electron diffusion effects.
-    Optimized for coalesced memory access.
+    Unified function to project a sparse 3D volume to a 2D plane with optional diffusion effects.
+    Supports both standard and differentiable projection modes.
     
     Args:
         coords (torch.Tensor): Coordinates of non-zero voxels (N, 3)
@@ -931,10 +735,17 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
         diffusion_sigma_t (float): Transverse diffusion coefficient (perpendicular to drift)
         diffusion_sigma_l (float): Longitudinal diffusion coefficient (along drift direction)
         attenuation_coeff (float): Electron attenuation coefficient due to impurities
+        differentiable (bool): Whether to use differentiable projection mode
         
     Returns:
         torch.Tensor: Projection of shape (x_size, u_size)
     """
+    # Edge case: empty volume
+    if coords.shape[0] == 0:
+        if projection_size is not None:
+            return torch.zeros(projection_size, device=device)
+        return torch.zeros((volume_shape[0], 1), device=device)
+    
     # Sort coordinates for better memory access patterns
     # Sort by x coordinate first, which will improve cache locality
     sorted_indices = torch.argsort(coords[:, 0])
@@ -993,76 +804,86 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
     # Calculate u coordinates for each point
     u_coords = -sorted_coords[:, 1] * sin_theta + sorted_coords[:, 2] * cos_theta - u_min
     
-    # Apply transverse diffusion if enabled
-    # This spreads out the signal perpendicular to the drift direction
-    if enable_diffusion:
-        # We need to spread out each point according to its diffusion sigma
-        # For performance reasons, we'll approximate by convolving with a discrete Gaussian later
+    if differentiable:
+        # For differentiable mode, use bilinear interpolation to maintain gradient flow
+        # Use floor and ceil to properly distribute contribution
+        u_lower = torch.floor(u_coords).long()
+        u_upper = u_lower + 1
         
-        # For now, we continue with bilinear interpolation as before
-        # but we'll add the diffusion effect in the final step
-        pass
-    
-    # Use floor and ceil to properly distribute contribution
-    # This allows for more accurate bilinear interpolation
-    u_lower = torch.floor(u_coords).long()
-    u_upper = u_lower + 1
-    
-    # Calculate weights for bilinear interpolation
-    u_weight_upper = u_coords - u_lower.float()
-    u_weight_lower = 1.0 - u_weight_upper
-    
-    # Get x indices
-    x_indices = sorted_coords[:, 0].long()
-    
-    # Filter out indices that would be outside the projection
-    # For lower u indices
-    valid_mask_lower = (x_indices >= 0) & (x_indices < x_size) & \
-                       (u_lower >= 0) & (u_lower < u_size)
-    
-    # For upper u indices
-    valid_mask_upper = (x_indices >= 0) & (x_indices < x_size) & \
-                       (u_upper >= 0) & (u_upper < u_size)
-    
-    # Create sparse tensors for each contribution
-    # Lower u contribution
-    if valid_mask_lower.any():
-        indices_lower = torch.stack([x_indices[valid_mask_lower], u_lower[valid_mask_lower]], dim=0)
-        values_lower = modified_values[valid_mask_lower] * u_weight_lower[valid_mask_lower]
-        lower_contribution = torch.sparse_coo_tensor(
-            indices_lower, 
-            values_lower,
-            size=(x_size, u_size),
-            device=device
-        )
+        # Calculate weights for bilinear interpolation
+        u_weight_upper = u_coords - u_lower.float()
+        u_weight_lower = 1.0 - u_weight_upper
+        
+        # Get x indices
+        x_indices = sorted_coords[:, 0].long()
+        
+        # Filter out indices that would be outside the projection
+        # For lower u indices
+        valid_mask_lower = (x_indices >= 0) & (x_indices < x_size) & \
+                        (u_lower >= 0) & (u_lower < u_size)
+        
+        # For upper u indices
+        valid_mask_upper = (x_indices >= 0) & (x_indices < x_size) & \
+                        (u_upper >= 0) & (u_upper < u_size)
+        
+        # Create sparse tensors for each contribution
+        # Lower u contribution
+        if valid_mask_lower.any():
+            indices_lower = torch.stack([x_indices[valid_mask_lower], u_lower[valid_mask_lower]], dim=0)
+            values_lower = modified_values[valid_mask_lower] * u_weight_lower[valid_mask_lower]
+            lower_contribution = torch.sparse_coo_tensor(
+                indices_lower, 
+                values_lower,
+                size=(x_size, u_size),
+                device=device
+            )
+        else:
+            lower_contribution = torch.sparse_coo_tensor(
+                torch.zeros((2, 0), dtype=torch.long, device=device),
+                torch.zeros(0, device=device),
+                size=(x_size, u_size),
+                device=device
+            )
+        
+        # Upper u contribution
+        if valid_mask_upper.any():
+            indices_upper = torch.stack([x_indices[valid_mask_upper], u_upper[valid_mask_upper]], dim=0)
+            values_upper = modified_values[valid_mask_upper] * u_weight_upper[valid_mask_upper]
+            upper_contribution = torch.sparse_coo_tensor(
+                indices_upper, 
+                values_upper,
+                size=(x_size, u_size),
+                device=device
+            )
+        else:
+            upper_contribution = torch.sparse_coo_tensor(
+                torch.zeros((2, 0), dtype=torch.long, device=device),
+                torch.zeros(0, device=device),
+                size=(x_size, u_size),
+                device=device
+            )
+        
+        # Sum the contributions and convert to dense tensor
+        projection = (lower_contribution + upper_contribution).to_dense()
     else:
-        lower_contribution = torch.sparse_coo_tensor(
-            torch.zeros((2, 0), dtype=torch.long, device=device),
-            torch.zeros(0, device=device),
+        # For non-differentiable mode, use rounding for better efficiency
+        u = torch.round(u_coords).long()
+        u = torch.clamp(u, min=0, max=u_size-1)  # Clamp to valid range
+        
+        # Create 2D indices for the sparse tensor
+        x_indices = sorted_coords[:, 0].long()
+        indices = torch.stack([x_indices, u], dim=0)
+        
+        # Create a sparse tensor and convert to dense
+        sparse_projection = torch.sparse_coo_tensor(
+            indices=indices,
+            values=modified_values,
             size=(x_size, u_size),
             device=device
         )
-    
-    # Upper u contribution
-    if valid_mask_upper.any():
-        indices_upper = torch.stack([x_indices[valid_mask_upper], u_upper[valid_mask_upper]], dim=0)
-        values_upper = modified_values[valid_mask_upper] * u_weight_upper[valid_mask_upper]
-        upper_contribution = torch.sparse_coo_tensor(
-            indices_upper, 
-            values_upper,
-            size=(x_size, u_size),
-            device=device
-        )
-    else:
-        upper_contribution = torch.sparse_coo_tensor(
-            torch.zeros((2, 0), dtype=torch.long, device=device),
-            torch.zeros(0, device=device),
-            size=(x_size, u_size),
-            device=device
-        )
-    
-    # Sum the contributions and convert to dense tensor
-    projection = (lower_contribution + upper_contribution).to_dense()
+        
+        # Convert to dense tensor
+        projection = sparse_projection.to_dense()
     
     # Apply transverse diffusion effect by convolving with Gaussian kernel if enabled
     if enable_diffusion:
@@ -1106,3 +927,53 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
         projection = diffused_projection.view(*projection.shape)
     
     return projection
+
+# Define aliases for backward compatibility
+def project_volume_cuda_sparse(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None):
+    """Legacy alias for project_sparse_volume (non-differentiable mode)"""
+    return project_sparse_volume(coords, values, volume_shape, theta, u_min, device, projection_size, 
+                               differentiable=False)
+
+def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None,
+                                        enable_diffusion=False, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, 
+                                        attenuation_coeff=0.0):
+    """Legacy alias for project_sparse_volume (differentiable mode)"""
+    return project_sparse_volume(coords, values, volume_shape, theta, u_min, device, projection_size,
+                               enable_diffusion=enable_diffusion, diffusion_sigma_t=diffusion_sigma_t,
+                               diffusion_sigma_l=diffusion_sigma_l, attenuation_coeff=attenuation_coeff,
+                               differentiable=True)
+
+# Mark these functions as deprecated - they will be removed in a future version
+def project_volume_cuda(volume, theta, u_min, device='cuda', projection_size=None):
+    """
+    DEPRECATED: Use project_sparse_volume instead.
+    Convert dense volume to sparse and call project_sparse_volume.
+    """
+    # Convert to sparse representation
+    non_zero_indices = torch.nonzero(volume, as_tuple=False)
+    if non_zero_indices.shape[0] == 0:
+        # Empty volume case
+        return torch.zeros((volume.shape[0], 1), device=device)
+        
+    non_zero_values = volume[non_zero_indices[:, 0], non_zero_indices[:, 1], non_zero_indices[:, 2]]
+    
+    # Use sparse projection
+    return project_sparse_volume(non_zero_indices, non_zero_values, volume.shape, theta, u_min, device, projection_size)
+
+def project_volume_differentiable(volume, theta, u_min, device='cuda', projection_size=None):
+    """
+    DEPRECATED: Use project_sparse_volume with differentiable=True instead.
+    Convert dense volume to sparse and call project_sparse_volume.
+    """
+    # Convert to sparse representation
+    coords = torch.nonzero(volume, as_tuple=False)
+    if coords.shape[0] == 0:
+        # Empty volume case
+        if projection_size is not None:
+            return torch.zeros(projection_size, device=device)
+        return torch.zeros((volume.shape[0], 1), device=device)
+        
+    values = volume[coords[:, 0], coords[:, 1], coords[:, 2]]
+    
+    # Use differentiable sparse projection
+    return project_sparse_volume(coords, values, volume.shape, theta, u_min, device, projection_size, differentiable=True)

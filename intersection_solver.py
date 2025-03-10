@@ -141,6 +141,7 @@ class LineIntersectionSolver:
     def project_volume_cuda(self, volume, theta, u_min, device=None, projection_size=None):
         """
         Project a 3D volume to a 2D projection using CUDA.
+        Automatically converts dense volumes to sparse format for efficiency.
         
         Args:
             volume (torch.Tensor): 3D volume of shape (N, N, N)
@@ -168,11 +169,28 @@ class LineIntersectionSolver:
             if plane_id is not None and hasattr(self, 'projection_sizes'):
                 projection_size = self.projection_sizes[plane_id]
         
-        # Import the CUDA projection function
-        from .cuda_kernels import project_volume_cuda as project_volume_cuda_func
+        # Convert to sparse representation for efficiency
+        coords = torch.nonzero(volume, as_tuple=False)
+        if coords.shape[0] > 0:
+            values = volume[coords[:, 0], coords[:, 1], coords[:, 2]]
+        else:
+            # Empty volume case
+            values = torch.tensor([], device=device)
+            
+        # Import the unified sparse projection function
+        from .cuda_kernels import project_sparse_volume
         
-        # Project the volume
-        return project_volume_cuda_func(volume, theta, u_min, device, projection_size=projection_size)
+        # Project the volume using sparse representation
+        return project_sparse_volume(
+            coords=coords,
+            values=values,
+            volume_shape=volume.shape,
+            theta=theta,
+            u_min=u_min,
+            device=device,
+            projection_size=projection_size,
+            differentiable=False  # Use non-differentiable mode for standard projection
+        )
     
     def backproject_plane(self, projection_data, plane_id):
         """

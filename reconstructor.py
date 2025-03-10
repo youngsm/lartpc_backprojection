@@ -79,38 +79,25 @@ class LArTPCReconstructor:
                 print(f"Projecting sparse volume with {coords.shape[0]} non-zero voxels...")
             else:
                 print(f"Projecting dense volume with shape {volume.shape}...")
+                print("Note: Dense volumes are automatically converted to sparse for efficiency.")
         
-        # Check if volume is a sparse representation
-        if isinstance(volume, tuple) and len(volume) == 3:
-            result = self.project_sparse_volume(volume)
-        else:
-            # Move volume to the device if needed
-            if volume.device.type != self.device:
-                volume = volume.to(self.device)
+        # Convert dense volumes to sparse for consistency and efficiency
+        if not isinstance(volume, tuple):
+            # Convert to sparse representation
+            coords = torch.nonzero(volume, as_tuple=False)
+            if coords.shape[0] > 0:
+                values = volume[coords[:, 0], coords[:, 1], coords[:, 2]]
+            else:
+                values = torch.tensor([], device=self.device)
+            shape = volume.shape
             
-            # Project volume for each plane
-            result = {}
-            for plane_id, theta in self.solver.plane_angles.items():
-                u_min = self.solver.u_min_values[plane_id]
-                projection_size = self.solver.projection_sizes[plane_id]
-                
-                if self.debug:
-                    print(f"  Projecting to plane {plane_id} with standardized size {projection_size}")
-                
-                # Call the project_volume_cuda method with the right arguments
-                result[plane_id] = self.solver.project_volume_cuda(
-                    volume=volume, 
-                    theta=theta, 
-                    u_min=u_min,
-                    device=self.device,
-                    projection_size=projection_size
-                )
+            # Create sparse volume
+            sparse_volume = (coords, values, shape)
+        else:
+            sparse_volume = volume
         
-        if self.debug:
-            end_time = time.time()
-            print(f"Projection to {len(result)} planes completed in {end_time - start_time:.2f} seconds")
-        
-        return result
+        # Use unified sparse volume projection for all cases
+        return self.project_sparse_volume(sparse_volume)
     
     def project_sparse_volume(self, sparse_volume):
         """
@@ -136,6 +123,8 @@ class LArTPCReconstructor:
         
         # Project volume for each plane
         projections = {}
+        from .cuda_kernels import project_sparse_volume
+        
         for plane_id, theta in self.solver.plane_angles.items():
             if self.debug:
                 plane_start = time.time()
@@ -144,10 +133,21 @@ class LArTPCReconstructor:
             u_min = self.solver.u_min_values[plane_id]
             projection_size = self.solver.projection_sizes[plane_id]
             
-            # Use sparse projection directly
-            from .cuda_kernels import project_volume_cuda_sparse
-            projection = project_volume_cuda_sparse(coords, values, shape, theta, u_min, 
-                                                  self.device, projection_size=projection_size)
+            # Use unified sparse projection
+            projection = project_sparse_volume(
+                coords=coords, 
+                values=values, 
+                volume_shape=shape,
+                theta=theta, 
+                u_min=u_min, 
+                device=self.device, 
+                projection_size=projection_size,
+                enable_diffusion=self.enable_diffusion,
+                diffusion_sigma_t=self.diffusion_sigma_t,
+                diffusion_sigma_l=self.diffusion_sigma_l,
+                attenuation_coeff=self.attenuation_coeff,
+                differentiable=False
+            )
             projections[plane_id] = projection
             
             if self.debug:
@@ -158,7 +158,7 @@ class LArTPCReconstructor:
         
         if self.debug:
             end_time = time.time()
-            print(f"All sparse projections completed in {end_time - start_time:.2f} seconds")
+            print(f"Projection to {len(projections)} planes completed in {end_time - start_time:.2f} seconds")
         
         return projections
     
@@ -181,31 +181,25 @@ class LArTPCReconstructor:
                 print(f"Differentiable projection of sparse volume with {coords.shape[0]} non-zero voxels...")
             else:
                 print(f"Differentiable projection of dense volume with shape {volume.shape}...")
+                print("Note: Dense volumes are automatically converted to sparse for efficiency.")
         
-        # Check if volume is a sparse representation
-        if isinstance(volume, tuple) and len(volume) == 3:
-            result = self.project_sparse_volume_differentiable(volume)
+        # Convert dense volumes to sparse for consistency and efficiency
+        if not isinstance(volume, tuple):
+            # Convert to sparse representation
+            coords = torch.nonzero(volume, as_tuple=False)
+            if coords.shape[0] > 0:
+                values = volume[coords[:, 0], coords[:, 1], coords[:, 2]]
+            else:
+                values = torch.tensor([], device=self.device)
+            shape = volume.shape
+            
+            # Create sparse volume
+            sparse_volume = (coords, values, shape)
         else:
-            # Move volume to the device if needed
-            if volume.device.type != self.device:
-                volume = volume.to(self.device)
-            
-            # Project volume for each plane using differentiable projection
-            result = {}
-            from .cuda_kernels import project_volume_differentiable
-            
-            for plane_id, theta in self.solver.plane_angles.items():
-                u_min = self.solver.u_min_values[plane_id]
-                projection_size = self.solver.projection_sizes[plane_id]
-                
-                result[plane_id] = project_volume_differentiable(volume, theta, u_min, 
-                                                               self.device, projection_size=projection_size)
+            sparse_volume = volume
         
-        if self.debug:
-            end_time = time.time()
-            print(f"Differentiable projection to {len(result)} planes completed in {end_time - start_time:.2f} seconds")
-        
-        return result
+        # Use differentiable sparse volume projection
+        return self.project_sparse_volume_differentiable(sparse_volume)
     
     def project_sparse_volume_differentiable(self, sparse_volume):
         """
@@ -234,7 +228,7 @@ class LArTPCReconstructor:
         
         # Project volume for each plane
         projections = {}
-        from .cuda_kernels import project_sparse_volume_differentiable
+        from .cuda_kernels import project_sparse_volume
         
         for plane_id, theta in self.solver.plane_angles.items():
             if self.debug:
@@ -244,14 +238,20 @@ class LArTPCReconstructor:
             u_min = self.solver.u_min_values[plane_id]
             projection_size = self.solver.projection_sizes[plane_id]
             
-            # Use differentiable sparse projection with diffusion parameters
-            projection = project_sparse_volume_differentiable(
-                coords, values, shape, theta, u_min, 
-                self.device, projection_size=projection_size,
+            # Use unified sparse projection with differentiable=True
+            projection = project_sparse_volume(
+                coords=coords, 
+                values=values, 
+                volume_shape=shape,
+                theta=theta, 
+                u_min=u_min, 
+                device=self.device, 
+                projection_size=projection_size,
                 enable_diffusion=self.enable_diffusion,
                 diffusion_sigma_t=self.diffusion_sigma_t,
                 diffusion_sigma_l=self.diffusion_sigma_l,
-                attenuation_coeff=self.attenuation_coeff
+                attenuation_coeff=self.attenuation_coeff,
+                differentiable=True
             )
             projections[plane_id] = projection
             
@@ -263,7 +263,7 @@ class LArTPCReconstructor:
         
         if self.debug:
             end_time = time.time()
-            print(f"All differentiable sparse projections completed in {end_time - start_time:.2f} seconds")
+            print(f"Differentiable projection to {len(projections)} planes completed in {end_time - start_time:.2f} seconds")
         
         return projections
     
