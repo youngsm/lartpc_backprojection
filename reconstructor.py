@@ -10,7 +10,8 @@ class LArTPCReconstructor:
     A high-level class that combines methods for projecting, backprojecting,
     and finding intersections for LArTPC reconstruction.
     """
-    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False, plane_angles=None):
+    def __init__(self, volume_shape, tolerance=1.0, merge_tolerance=1.0, device='cuda', debug=False, plane_angles=None,
+                 enable_diffusion=False, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, attenuation_coeff=0.0):
         """
         Initialize the reconstructor.
         
@@ -22,6 +23,10 @@ class LArTPCReconstructor:
             debug (bool): Whether to print debug information
             plane_angles (dict, optional): Dictionary mapping plane_id to angle in radians.
                                         If None, uses default angles (0°, 90°, 60°, 120°).
+            enable_diffusion (bool): Whether to enable electron diffusion effects
+            diffusion_sigma_t (float): Transverse diffusion coefficient (perpendicular to drift)
+            diffusion_sigma_l (float): Longitudinal diffusion coefficient (along drift direction)
+            attenuation_coeff (float): Electron attenuation coefficient due to impurities
         """
         self.volume_shape = volume_shape
         self.tolerance = tolerance
@@ -29,6 +34,12 @@ class LArTPCReconstructor:
         self.device = device
         self.debug = debug
         self.plane_angles = plane_angles
+        
+        # LArTPC physics simulation parameters
+        self.enable_diffusion = enable_diffusion
+        self.diffusion_sigma_t = diffusion_sigma_t
+        self.diffusion_sigma_l = diffusion_sigma_l
+        self.attenuation_coeff = attenuation_coeff
         
         # Create the solver
         self.solver = LineIntersectionSolver(
@@ -212,6 +223,8 @@ class LArTPCReconstructor:
         if self.debug:
             start_time = time.time()
             print(f"Differentiable projection of sparse volume from {coords.shape[0]} non-zero voxels...")
+            if self.enable_diffusion:
+                print(f"  Applying electron diffusion effects (sigma_t={self.diffusion_sigma_t}, sigma_l={self.diffusion_sigma_l})")
         
         # Move to the device if needed
         if coords.device.type != self.device:
@@ -231,9 +244,15 @@ class LArTPCReconstructor:
             u_min = self.solver.u_min_values[plane_id]
             projection_size = self.solver.projection_sizes[plane_id]
             
-            # Use differentiable sparse projection
-            projection = project_sparse_volume_differentiable(coords, values, shape, theta, u_min, 
-                                                            self.device, projection_size=projection_size)
+            # Use differentiable sparse projection with diffusion parameters
+            projection = project_sparse_volume_differentiable(
+                coords, values, shape, theta, u_min, 
+                self.device, projection_size=projection_size,
+                enable_diffusion=self.enable_diffusion,
+                diffusion_sigma_t=self.diffusion_sigma_t,
+                diffusion_sigma_l=self.diffusion_sigma_l,
+                attenuation_coeff=self.attenuation_coeff
+            )
             projections[plane_id] = projection
             
             if self.debug:
@@ -1210,4 +1229,28 @@ class LArTPCReconstructor:
                 np.sin(theta)         # z-component
             ])
         
-        return directions 
+        return directions
+
+    def set_diffusion_parameters(self, enable_diffusion=True, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, attenuation_coeff=0.0):
+        """
+        Set the parameters for electron diffusion and attenuation simulation.
+        
+        Args:
+            enable_diffusion (bool): Whether to enable electron diffusion effects
+            diffusion_sigma_t (float): Transverse diffusion coefficient (perpendicular to drift)
+            diffusion_sigma_l (float): Longitudinal diffusion coefficient (along drift direction)
+            attenuation_coeff (float): Electron attenuation coefficient due to impurities
+        """
+        self.enable_diffusion = enable_diffusion
+        self.diffusion_sigma_t = diffusion_sigma_t
+        self.diffusion_sigma_l = diffusion_sigma_l
+        self.attenuation_coeff = attenuation_coeff
+        
+        if self.debug:
+            if enable_diffusion:
+                print(f"Diffusion enabled with parameters:")
+                print(f"  Transverse diffusion sigma: {diffusion_sigma_t}")
+                print(f"  Longitudinal diffusion sigma: {diffusion_sigma_l}")
+                print(f"  Attenuation coefficient: {attenuation_coeff}")
+            else:
+                print("Diffusion effects disabled") 

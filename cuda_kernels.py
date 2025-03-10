@@ -912,9 +912,11 @@ def project_volume_differentiable(volume, theta, u_min, device='cuda', projectio
     return projection
 
 
-def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None):
+def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None,
+                                        enable_diffusion=False, diffusion_sigma_t=1.0, diffusion_sigma_l=0.5, 
+                                        attenuation_coeff=0.0):
     """
-    Differentiable projection of a sparse volume to a 2D plane.
+    Differentiable projection of a sparse volume to a 2D plane with optional electron diffusion effects.
     Optimized for coalesced memory access.
     
     Args:
@@ -925,6 +927,10 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
         u_min (float): Minimum u-coordinate
         device (str): Device to use for computation
         projection_size (tuple, optional): Size of the projection (x_size, u_size)
+        enable_diffusion (bool): Whether to enable electron diffusion effects
+        diffusion_sigma_t (float): Transverse diffusion coefficient (perpendicular to drift)
+        diffusion_sigma_l (float): Longitudinal diffusion coefficient (along drift direction)
+        attenuation_coeff (float): Electron attenuation coefficient due to impurities
         
     Returns:
         torch.Tensor: Projection of shape (x_size, u_size)
@@ -959,8 +965,43 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
     sin_theta = torch.sin(torch.tensor(theta, device=device))
     cos_theta = torch.cos(torch.tensor(theta, device=device))
     
+    # Apply electron diffusion and attenuation if enabled
+    if enable_diffusion:
+        # Make a copy of values to avoid modifying original
+        modified_values = sorted_values.clone()
+        
+        # Drift distance from each point to X=0 (anode)
+        # In LArTPC, electrons drift along X-axis to X=0
+        drift_distances = sorted_coords[:, 0].float()
+        
+        # Apply attenuation based on drift distance if coefficient > 0
+        if attenuation_coeff > 0:
+            attenuation_factor = torch.exp(-attenuation_coeff * drift_distances)
+            modified_values = modified_values * attenuation_factor
+        
+        # Calculate diffusion sigma for each point based on drift distance
+        # Diffusion increases with sqrt of drift distance
+        sigma_t = diffusion_sigma_t * torch.sqrt(drift_distances)
+        sigma_l = diffusion_sigma_l * torch.sqrt(drift_distances)
+        
+        # Proceed with modified values and apply diffusion in the projection space
+        sorted_values = modified_values
+    else:
+        # Use original values if diffusion is disabled
+        modified_values = sorted_values
+    
     # Calculate u coordinates for each point
     u_coords = -sorted_coords[:, 1] * sin_theta + sorted_coords[:, 2] * cos_theta - u_min
+    
+    # Apply transverse diffusion if enabled
+    # This spreads out the signal perpendicular to the drift direction
+    if enable_diffusion:
+        # We need to spread out each point according to its diffusion sigma
+        # For performance reasons, we'll approximate by convolving with a discrete Gaussian later
+        
+        # For now, we continue with bilinear interpolation as before
+        # but we'll add the diffusion effect in the final step
+        pass
     
     # Use floor and ceil to properly distribute contribution
     # This allows for more accurate bilinear interpolation
@@ -987,7 +1028,7 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
     # Lower u contribution
     if valid_mask_lower.any():
         indices_lower = torch.stack([x_indices[valid_mask_lower], u_lower[valid_mask_lower]], dim=0)
-        values_lower = sorted_values[valid_mask_lower] * u_weight_lower[valid_mask_lower]
+        values_lower = modified_values[valid_mask_lower] * u_weight_lower[valid_mask_lower]
         lower_contribution = torch.sparse_coo_tensor(
             indices_lower, 
             values_lower,
@@ -1005,7 +1046,7 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
     # Upper u contribution
     if valid_mask_upper.any():
         indices_upper = torch.stack([x_indices[valid_mask_upper], u_upper[valid_mask_upper]], dim=0)
-        values_upper = sorted_values[valid_mask_upper] * u_weight_upper[valid_mask_upper]
+        values_upper = modified_values[valid_mask_upper] * u_weight_upper[valid_mask_upper]
         upper_contribution = torch.sparse_coo_tensor(
             indices_upper, 
             values_upper,
@@ -1022,5 +1063,46 @@ def project_sparse_volume_differentiable(coords, values, volume_shape, theta, u_
     
     # Sum the contributions and convert to dense tensor
     projection = (lower_contribution + upper_contribution).to_dense()
+    
+    # Apply transverse diffusion effect by convolving with Gaussian kernel if enabled
+    if enable_diffusion:
+        # Create a set of 1D Gaussian kernels based on the diffusion sigmas
+        # We need to create a kernel for each x-position since diffusion varies with drift distance
+        
+        # For efficiency, we'll use a simpler approach - a single Gaussian blur based on average sigma
+        # In a real implementation, you might want a more precise approach with position-dependent kernels
+        
+        # Compute average sigma for transverse diffusion
+        if len(drift_distances) > 0:
+            avg_sigma_t = (diffusion_sigma_t * torch.sqrt(drift_distances.mean())).item()
+        else:
+            avg_sigma_t = diffusion_sigma_t
+            
+        # Create Gaussian kernel for convolution
+        kernel_size = max(3, int(6 * avg_sigma_t))  # Ensure kernel covers at least 3σ on each side
+        if kernel_size % 2 == 0:  # Ensure odd kernel size for symmetric convolution
+            kernel_size += 1
+            
+        # Create 1D Gaussian kernel
+        kernel_range = torch.arange(kernel_size, device=device) - (kernel_size // 2)
+        kernel = torch.exp(-(kernel_range ** 2) / (2 * avg_sigma_t ** 2))
+        kernel = kernel / kernel.sum()  # Normalize
+        
+        # Reshape kernel for 2D convolution (1xkernel_size)
+        kernel_y = kernel.view(1, 1, 1, -1)
+        
+        # Apply convolution in y dimension only (transverse diffusion)
+        # First reshape projection for convolution
+        projection_reshaped = projection.view(1, 1, *projection.shape)
+        
+        # Pad the projection for convolution
+        pad_size = kernel_size // 2
+        padded_projection = torch.nn.functional.pad(projection_reshaped, (pad_size, pad_size, 0, 0), mode='replicate')
+        
+        # Apply convolution
+        diffused_projection = torch.nn.functional.conv2d(padded_projection, kernel_y.to(device))
+        
+        # Extract the result
+        projection = diffused_projection.view(*projection.shape)
     
     return projection
