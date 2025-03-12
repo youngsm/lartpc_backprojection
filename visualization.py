@@ -84,7 +84,7 @@ def visualize_projections(projections, figsize=(15, 5), lognorm=False):
         # Get angle label
         
         # Plot projection
-        im = axes[i].imshow(proj.T, aspect='auto', origin='lower', cmap='viridis', interpolation='none', norm=LogNorm() if lognorm else None)
+        im = axes[i].imshow(proj, aspect='auto', cmap='viridis', interpolation='none', norm=LogNorm() if lognorm else None)
         axes[i].set_title(f'Projection {i}')
         axes[i].set_xlabel('X (drift)')
         axes[i].set_ylabel('U (wire)')

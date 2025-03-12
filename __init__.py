@@ -1,11 +1,8 @@
-from .line_representation import Line3D, BoundingBox
-from .spatial_partitioning import BVH, find_potential_intersections
 from .cuda_kernels import (
     closest_points_between_lines_cuda,
-    find_intersections_cuda,
-    merge_nearby_intersections_cuda,
-    backproject_hits_cuda,
-    project_sparse_volume
+    find_intersections_between_lines_cuda,
+    backproject_hits_into_lines_cuda,
+    project_coordinates_to_plane,
 )
 from .intersection_solver import LineIntersectionSolver
 from .reconstructor import LArTPCReconstructor
@@ -19,9 +16,6 @@ from .visualization import (
 
 __all__ = [
     'Line3D',
-    'BoundingBox',
-    'BVH',
-    'find_potential_intersections',
     'closest_points_between_lines_cuda',
     'find_intersections_cuda',
     'merge_nearby_intersections_cuda',

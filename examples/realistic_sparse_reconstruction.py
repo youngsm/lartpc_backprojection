@@ -16,6 +16,115 @@ from lartpc_reconstruction.visualization import (
     visualize_projections, 
     visualize_original_vs_reconstructed
 )
+
+def get_input_points():
+    # Crop input_points to a 128x128x128 volume using a density-based approach
+    import numpy as np
+    import h5py
+
+    f = h5py.File(
+        "/sdf/home/y/youngsam/data/dune/larnet/h5/DataAccessExamples/val/generic_v2_10880_v1.h5",
+        "r",
+        swmr=True,
+    )
+    input_points = f["point"][1].reshape(-1, 8)[:, :4]
+    f.close()
+
+    # Define the original and target volume dimensions
+    original_shape = (768, 768, 768)
+    target_shape = (100, 100, 100)
+
+    # Extract coordinates from input_points (first 3 columns)
+    point_coords = input_points[:, :3]
+
+    # Compute a coarse density grid to find the highest density region
+    # Use a grid with cells that are 1/4 the size of the target volume
+    grid_cell_size = target_shape[0] // 4
+    grid_shape = (
+        original_shape[0] // grid_cell_size + 1,
+        original_shape[1] // grid_cell_size + 1,
+        original_shape[2] // grid_cell_size + 1,
+    )
+
+    # Create a density grid
+    density_grid = np.zeros(grid_shape, dtype=int)
+
+    # Count points in each grid cell
+    for point in point_coords:
+        grid_x = int(point[0]) // grid_cell_size
+        grid_y = int(point[1]) // grid_cell_size
+        grid_z = int(point[2]) // grid_cell_size
+        if (
+            0 <= grid_x < grid_shape[0]
+            and 0 <= grid_y < grid_shape[1]
+            and 0 <= grid_z < grid_shape[2]
+        ):
+            density_grid[grid_x, grid_y, grid_z] += 1
+
+    # Find the grid cell with the highest density
+    max_density_idx = np.unravel_index(np.argmax(density_grid), grid_shape)
+
+    # Convert grid cell index to volume coordinates (center of the cell)
+    density_center = (
+        max_density_idx[0] * grid_cell_size + grid_cell_size // 2,
+        max_density_idx[1] * grid_cell_size + grid_cell_size // 2,
+        max_density_idx[2] * grid_cell_size + grid_cell_size // 2,
+    )
+
+    # Calculate the start coordinates for the crop
+    # Ensure the crop is centered around the highest density point
+    start_x = max(
+        0,
+        min(original_shape[0] - target_shape[0], density_center[0] - target_shape[0] // 2),
+    )
+    start_y = max(
+        0,
+        min(original_shape[1] - target_shape[1], density_center[1] - target_shape[1] // 2),
+    )
+    start_z = max(
+        0,
+        min(original_shape[2] - target_shape[2], density_center[2] - target_shape[2] // 2),
+    )
+
+    # Define the crop boundaries
+    end_x = start_x + target_shape[0]
+    end_y = start_y + target_shape[1]
+    end_z = start_z + target_shape[2]
+
+    # Crop the input points
+    mask = (
+        (point_coords[:, 0] >= start_x)
+        & (point_coords[:, 0] < end_x)
+        & (point_coords[:, 1] >= start_y)
+        & (point_coords[:, 1] < end_y)
+        & (point_coords[:, 2] >= start_z)
+        & (point_coords[:, 2] < end_z)
+    )
+
+    cropped_points = input_points[
+        mask
+    ].copy()  # Create a copy to avoid modifying original data
+
+    # Adjust coordinates to be relative to the new volume (0-127 range)
+    cropped_points[:, 0] = cropped_points[:, 0] - start_x
+    cropped_points[:, 1] = cropped_points[:, 1] - start_y
+    cropped_points[:, 2] = cropped_points[:, 2] - start_z
+
+    # Verify all points are within the target shape bounds
+    assert np.all(cropped_points[:, 0] >= 0) and np.all(
+        cropped_points[:, 0] < target_shape[0]
+    )
+    assert np.all(cropped_points[:, 1] >= 0) and np.all(
+        cropped_points[:, 1] < target_shape[1]
+    )
+    assert np.all(cropped_points[:, 2] >= 0) and np.all(
+        cropped_points[:, 2] < target_shape[2]
+    )
+
+    # Update input_points to use the cropped points
+    input_points = cropped_points
+    return input_points
+
 tracks = [
     ((20, 20, 20), (100, 100, 100)),  # Diagonal line
     ((20, 50, 50), (100, 50, 50)),  # Horizontal line
@@ -67,7 +176,8 @@ input_points = helix_points
 input_points = sine_points
 
 # Option 4: Combine multiple sets
-input_points = np.vstack([helix_points, sine_points, track_points])
+# input_points = np.vstack([helix_points, sine_points, track_points])
+# input_points = get_input_points()
 
 def create_volume_from_points(points, volume_shape, radius=0.0, device="cuda"):
     """
@@ -192,13 +302,13 @@ def create_volume_from_points(points, volume_shape, radius=0.0, device="cuda"):
 
     return sparse_volume, dense_volume, points
 
-def run_realistic_sparse_reconstruction(optimization_method='adam'):
+def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l1'):
     """
     Demonstrate a realistic sparse point-based differentiable reconstruction.
     Uses the actual backprojection process to get candidate points.
     
     Args:
-        optimization_method (str): The optimization method to use, either 'adam' or 'admm'
+        optimization_method (str): The optimization method to use, 'adam'
     """
     print(f"Running realistic sparse point-based differentiable reconstruction using {optimization_method.upper()}...")
     
@@ -210,22 +320,6 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     print("Creating ground truth volume...")
     volume_shape = (100, 100, 100)
     
-    # # Create a cube in the center of the volume
-    # cube_size = 30
-    # start_idx = (volume_shape[0] - cube_size) // 2
-    # end_idx = start_idx + cube_size
-    
-    # # Create dense ground truth
-    # ground_truth = torch.zeros(volume_shape, device=device)
-    # ground_truth[start_idx:end_idx, start_idx:end_idx, start_idx:end_idx] = 1.0
-    
-    # # Add some random noise to make it more interesting
-    # noise = torch.randn(volume_shape, device=device) * 0.05
-    # ground_truth = torch.clamp(ground_truth + noise, 0, 1)
-    
-    # # Convert to sparse representation for efficiency
-    # non_zero_indices = torch.nonzero(ground_truth > 0.1, as_tuple=False)
-    # non_zero_values = ground_truth[non_zero_indices[:, 0], non_zero_indices[:, 1], non_zero_indices[:, 2]]
     
     # Create sparse ground truth
     ground_truth_sparse, ground_truth, original_points = create_volume_from_points(input_points, volume_shape, radius=0.0, device=device)
@@ -233,8 +327,9 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     
     # Create reconstructor with three planes
     print("Creating reconstructor with 3 planes...")
-    plane_angles = {0: 0.0, 1: -np.pi/6, 2: np.pi/6}  # Three planes at different angles
+    plane_angles = {0: np.pi, 1: -np.pi/3, 2: np.pi/3}  # Three planes at different angles
     reconstructor = LArTPCReconstructor(
+        intersection_tolerance=1e-1,
         volume_shape=volume_shape, 
         device=device,
         plane_angles=plane_angles,
@@ -243,7 +338,7 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     
     # Generate projections from ground truth
     print("Generating 2D projections from ground truth...")
-    projections = reconstructor.project_sparse_volume_differentiable(ground_truth_sparse)
+    projections = reconstructor.project_sparse_volume(ground_truth_sparse)
     
     # Visualize ground truth and projections
     print("Visualizing ground truth and projections...")
@@ -254,11 +349,11 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     print("Thresholding projections to simulate detector hits...")
     thresholded_projections = projections
 
-    # threshold = 0.1
-    # thresholded_projections = {}
+    threshold = 0.0
+    thresholded_projections = {}
 
-    # for plane_id, projection in projections.items():
-    #     thresholded_projections[plane_id] = (projection > threshold).float()
+    for plane_id, projection in projections.items():
+        thresholded_projections[plane_id] = (projection > threshold).float()
     
     # Use the standard reconstruction process to get candidate points
     print("Reconstructing candidate points using standard method...")
@@ -266,8 +361,8 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     candidate_points = reconstructor.reconstruct_from_projections(
         thresholded_projections, 
         threshold=backprojection_threshold,
-        fast_merge=True, 
-        snap_to_grid=True
+        snap_to_grid=True,  
+        voxel_size=1.0
     )
     
     print(f"Generated {candidate_points.shape[0]} candidate points from backprojection")
@@ -286,38 +381,22 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     # Optimization parameters
     num_iterations = 5000 if optimization_method == 'adam' else 200  # ADMM typically needs fewer iterations
     learning_rate = 0.01
-    pruning_threshold = 0.01
-    pruning_interval = 250 if optimization_method == 'adam' else 10000
-    l1_weight = 0.01
+    pruning_threshold = 0.001
+    pruning_interval = 1000 if optimization_method == 'adam' else 10000
+    l1_weight = 0.001
     
     # Run optimization with the specified method
-    if optimization_method == 'adam':
-        # Use Adam (SGD) optimization
-        optimized_coords, optimized_values, loss_history, num_points_history = reconstructor.optimize_sparse_point_intensities(
-            candidate_points=candidate_points_long,
-            target_projections=projections,
-            num_iterations=num_iterations,
-            lr=learning_rate,
-            pruning_threshold=pruning_threshold,
-            pruning_interval=pruning_interval,
-            l1_weight=l1_weight,
-        )
-    else:  # 'admm'
-        # Use ADMM optimization
-        rho = 1.0
-        alpha = 1.0
-        relaxation = 1.0
-        optimized_coords, optimized_values, loss_history, num_points_history = reconstructor.optimize_sparse_point_intensities_admm(
-            candidate_points=candidate_points_long,
-            target_projections=projections,
-            num_iterations=num_iterations,
-            rho=rho,
-            alpha=alpha,
-            pruning_threshold=pruning_threshold,
-            pruning_interval=pruning_interval,
-            l1_weight=l1_weight,
-            relaxation=relaxation
-        )
+    # Use Adam (SGD) optimization
+    optimized_coords, optimized_values, loss_history, num_points_history = reconstructor.optimize_point_intensities(
+        candidate_points=candidate_points_long,
+        target_projections=projections,
+        num_iterations=num_iterations,
+        lr=learning_rate,
+        pruning_threshold=pruning_threshold,
+        pruning_interval=pruning_interval,
+        l1_weight=l1_weight,
+        loss_func=loss_func
+    )
     
     # Convert final result to dense for visualization
     final_volume = torch.zeros(volume_shape, device=device)
@@ -340,33 +419,75 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     plt.close(fig)
     
     # Visualize comparison of projections
-    final_projections = reconstructor.project_sparse_volume_differentiable(
+    final_projections = reconstructor.project_sparse_volume(
         (optimized_coords, optimized_values, volume_shape)
     )
     
     # Create a figure to compare original and final projections
-    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
-    
-    for i, plane_id in enumerate(projections):
-        # Original projection
-        orig_proj = projections[plane_id].cpu().detach().numpy()
-        im = axes[i, 0].imshow(orig_proj, aspect='auto', cmap='viridis', interpolation='none', norm=LogNorm())
-        axes[i, 0].set_title(f"Original Projection (Plane {plane_id})")
-        plt.colorbar(im, ax=axes[i, 0])
+    for norm in [None, LogNorm()]:
+        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
         
-        # Optimized projection
-        final_proj = final_projections[plane_id].cpu().detach().numpy()
-        im = axes[i, 1].imshow(final_proj, aspect='auto', cmap='viridis', interpolation='none', norm=LogNorm())
-        axes[i, 1].set_title(f"Optimized Projection (Plane {plane_id})")
-        plt.colorbar(im, ax=axes[i, 1])
-    
-    plt.tight_layout()
-    plt.savefig(f"img/realistic_projection_comparison_{optimization_method}.png")
-    plt.close()
-    
+        for i, plane_id in enumerate(projections):
+            # Original projection
+            orig_proj = projections[plane_id].cpu().detach().numpy()
+            
+            # Optimized projection
+            final_proj = final_projections[plane_id].cpu().detach().numpy()
+            
+            # Difference projection
+            diff_proj = final_proj - orig_proj
+            
+            # Find common min/max for consistent colorbar
+            vmin = min(orig_proj.min(), final_proj.min())
+            vmax = max(orig_proj.max(), final_proj.max())
+            
+            # Original projection
+            im = axes[i, 0].imshow(
+                orig_proj,
+                aspect='auto',
+                cmap='viridis',
+                interpolation='none',
+                norm=norm,
+                vmin=None if norm else vmin,
+                vmax=None if norm else vmax
+            )
+            axes[i, 0].set_title(f"Original Projection (Plane {plane_id})")
+            plt.colorbar(im, ax=axes[i, 0])
+            
+            # Optimized projection
+            im_final = axes[i, 1].imshow(
+                final_proj,
+                aspect='auto',
+                cmap='viridis',
+                interpolation='none',
+                norm=norm,
+                vmin=None if norm else vmin,
+                vmax=None if norm else vmax
+            )
+            axes[i, 1].set_title(f"Optimized Projection (Plane {plane_id})")
+            plt.colorbar(im_final, ax=axes[i, 1])
+            
+            # Difference projection
+            diff_max = max(abs(diff_proj.min()), abs(diff_proj.max()))
+            im_diff = axes[i, 2].imshow(
+                diff_proj,
+                aspect='auto',
+                cmap='bwr',
+                interpolation='none',
+                vmin=-diff_max,
+                vmax=diff_max
+            )
+            axes[i, 2].set_title(f"Difference (Plane {plane_id})")
+            plt.colorbar(im_diff, ax=axes[i, 2])
+        
+        plt.tight_layout()
+        plt.savefig(f"img/realistic_projection_comparison_{optimization_method}_{'log' if norm else 'linear'}.png")
+        plt.close()
+
+
     # Calculate how many original points are included in the reconstruction
     # An original point is considered "included" if there's a reconstructed point close to it
-    inclusion_threshold = 1.1  # Maximum distance for a point to be considered included
+    inclusion_threshold = 1.0  # Maximum distance for a point to be considered included
     original_points_array = torch.stack(original_points) if isinstance(original_points, list) else original_points
     total_original_points = len(original_points_array)
     
@@ -374,7 +495,7 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     if len(optimized_coords) > 0:
         for orig_point in original_points_array:
             # Calculate distances to all reconstructed points
-            distances = torch.norm(optimized_coords.float().cpu() - orig_point[None, ...], dim=1)
+            distances = torch.norm(optimized_coords.float().cpu() - orig_point[None, :3], dim=1)
             # If any reconstructed point is close enough, consider the original point included
             if torch.any(distances < inclusion_threshold):
                 included_count += 1
@@ -423,7 +544,7 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
     # Non-zero metrics with emphasis
     special_metrics = ['mse_nonzero', 'psnr_nonzero']
     if any(m in metrics for m in special_metrics):
-        print("\n  Non-zero region metrics (only considering pixels where target > 0):")
+        print("\n  Non-zero region metrics (only considering pixels where reconstructed or truth > 0):")
         for metric_name in special_metrics:
             if metric_name in metrics:
                 print(f"    {metric_name}: {metrics[metric_name]:.6f}")
@@ -434,7 +555,7 @@ def run_realistic_sparse_reconstruction(optimization_method='adam'):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Run realistic sparse reconstruction example')
-    parser.add_argument('--method', type=str, choices=['adam', 'admm', 'both'], default='both',
+    parser.add_argument('--method', type=str, choices=['adam'], default='adam',
                         help='Optimization method to use: adam, admm, or both')
     args = parser.parse_args()
     
@@ -455,105 +576,10 @@ if __name__ == "__main__":
     input_points.extend(second_sine)
     
     # Convert to tensor
-    input_points = torch.tensor(input_points, dtype=torch.float32)
+    input_points = torch.tensor(get_input_points(), dtype=torch.float32)
     
     if args.method == 'adam':
         # Run with Adam only
-        run_realistic_sparse_reconstruction(optimization_method='adam')
-    elif args.method == 'admm':
-        # Run with ADMM only
-        run_realistic_sparse_reconstruction(optimization_method='admm')
+        run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l1')
     else:  # 'both'
-        # Run with both methods and compare
-        print("\n========== Running with Adam optimization ==========\n")
-        adam_metrics, adam_volume = run_realistic_sparse_reconstruction(optimization_method='adam')
-        
-        print("\n========== Running with ADMM optimization ==========\n")
-        admm_metrics, admm_volume = run_realistic_sparse_reconstruction(optimization_method='admm')
-        
-        # Compare metrics
-        print("\n========== Comparison of Metrics ==========")
-        print(f"{'Metric':<20} {'Adam':<15} {'ADMM':<15} {'Difference':<15}")
-        print("-" * 65)
-        
-        # First standard metrics
-        standard_metrics = ['iou', 'dice', 'precision', 'recall', 'f1', 'mse', 'psnr']
-        for metric in standard_metrics:
-            if metric in adam_metrics:
-                adam_val = adam_metrics[metric]
-                admm_val = admm_metrics[metric]
-                diff = admm_val - adam_val
-                print(f"{metric:<20} {adam_val:<15.6f} {admm_val:<15.6f} {diff:<15.6f}")
-        
-        # Then non-zero metrics with emphasis
-        special_metrics = ['mse_nonzero', 'psnr_nonzero']
-        if any(m in adam_metrics for m in special_metrics):
-            print("\nNon-zero region metrics (only considering pixels where target > 0):")
-            print("-" * 65)
-            for metric in special_metrics:
-                if metric in adam_metrics:
-                    adam_val = adam_metrics[metric]
-                    admm_val = admm_metrics[metric]
-                    diff = admm_val - adam_val
-                    print(f"{metric:<20} {adam_val:<15.6f} {admm_val:<15.6f} {diff:<15.6f}")
-        
-        # Create a direct visual comparison of the two reconstructions and metrics
-        print("\nGenerating side-by-side comparison of reconstructions...")
-        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-        
-        im1 = axes[0].imshow(np.max(adam_volume.cpu().numpy(), axis=0), cmap='viridis')
-        axes[0].set_title("Adam Reconstruction")
-        plt.colorbar(im1, ax=axes[0])
-        
-        im2 = axes[1].imshow(np.max(admm_volume.cpu().numpy(), axis=0), cmap='viridis')
-        axes[1].set_title("ADMM Reconstruction")
-        plt.colorbar(im2, ax=axes[1])
-        
-        plt.tight_layout()
-        plt.savefig("img/adam_vs_admm_comparison.png")
-        plt.close()
-        
-        # Add a special visualization for PSNR comparison
-        if ('psnr' in adam_metrics and 'psnr' in admm_metrics and 
-            'psnr_nonzero' in adam_metrics and 'psnr_nonzero' in admm_metrics):
-            print("\nGenerating PSNR comparison chart...")
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            # Data to plot
-            methods = ['Adam', 'ADMM']
-            psnr_standard = [adam_metrics['psnr'], admm_metrics['psnr']]
-            psnr_nonzero = [adam_metrics['psnr_nonzero'], admm_metrics['psnr_nonzero']]
-            
-            # Set up width and positions
-            x = np.arange(len(methods))
-            width = 0.35
-            
-            # Create bars
-            rects1 = ax.bar(x - width/2, psnr_standard, width, label='Standard PSNR', color='skyblue')
-            rects2 = ax.bar(x + width/2, psnr_nonzero, width, label='Non-zero PSNR', color='orange')
-            
-            # Add labels, title, and legend
-            ax.set_ylabel('PSNR (dB)')
-            ax.set_title('PSNR Comparison: All Pixels vs. Non-Zero Pixels Only')
-            ax.set_xticks(x)
-            ax.set_xticklabels(methods)
-            ax.legend()
-            
-            # Add value labels on bars
-            def autolabel(rects):
-                for rect in rects:
-                    height = rect.get_height()
-                    ax.annotate(f'{height:.2f}',
-                                xy=(rect.get_x() + rect.get_width()/2, height),
-                                xytext=(0, 3),
-                                textcoords="offset points",
-                                ha='center', va='bottom')
-            
-            autolabel(rects1)
-            autolabel(rects2)
-            
-            plt.tight_layout()
-            plt.savefig("img/adam_vs_admm_psnr_comparison.png")
-            plt.close()
-        
-        print("\nComparison completed. Check the 'img' directory for output images.") 
+        raise ValueError("Invalid method: only adam supported for now")
