@@ -5,7 +5,7 @@ from matplotlib.colors import LogNorm
 from mpl_toolkits.mplot3d import Axes3D
 import torch
 
-def visualize_volume(volume, threshold=0.1, alpha=0.5, figsize=(10, 8)):
+def visualize_volume(volume, threshold=0.1, alpha=0.5, figsize=(10, 8), title='3D Volume Visualization'):
     """
     Visualize a 3D volume using a 3D scatter plot.
     
@@ -38,13 +38,13 @@ def visualize_volume(volume, threshold=0.1, alpha=0.5, figsize=(10, 8)):
     scatter = ax.scatter(x, y, z, c=values, alpha=alpha, cmap='viridis', norm=norm)
     
     # Add colorbar
-    plt.colorbar(scatter, ax=ax, label='Intensity')
+    plt.colorbar(scatter, ax=ax, label='Energy (MeV)')
     
     # Set labels
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.set_title('3D Volume Visualization')
+    ax.set_xlabel('X', fontsize=22)
+    ax.set_ylabel('Y', fontsize=22)
+    ax.set_zlabel('Z', fontsize=22)
+    ax.set_title(title, fontsize=22)
     
     # Set axis limits
     ax.set_xlim(0, volume.shape[0])
@@ -73,23 +73,33 @@ def visualize_projections(projections, figsize=(15, 5), lognorm=False):
             projections_np[plane_id] = proj
     
     # Create figure
-    fig, axes = plt.subplots(1, len(projections), figsize=figsize)
+    fig, axes = plt.subplots(1, len(projections), figsize=figsize, dpi=72)
     if len(projections) == 1:
         axes = [axes]
     
     # Map plane_id to angle labels
     
     # Plot each projection
+    angles = {0: 90, 1: 30, 2: -30}
     for i, (plane_id, proj) in enumerate(projections_np.items()):
         # Get angle label
+        angle = angles[plane_id]
+        angle_label = f"{angle}°" if angle != 90 else "90°"
         
         # Plot projection
-        im = axes[i].imshow(proj, aspect='auto', cmap='viridis', interpolation='none', norm=LogNorm() if lognorm else None)
-        axes[i].set_title(f'Projection {i}')
-        axes[i].set_xlabel('X (drift)')
-        axes[i].set_ylabel('U (wire)')
-        plt.colorbar(im, ax=axes[i])
-    
+        im = axes[i].imshow(
+            proj,
+            aspect='auto',
+            cmap='viridis',
+            interpolation='none',
+            norm=LogNorm() if lognorm else None
+        )
+        axes[i].set_title(f'Projection {i} ({angle_label})', fontsize=22)
+        axes[i].set_xlabel('X (drift)', fontsize=22)
+        axes[i].set_ylabel('U (wire)', fontsize=22)
+        axes[i].set_xticks([])
+        axes[i].set_yticks([])
+        plt.colorbar(im, ax=axes[i], label='Energy (MeV)')
     plt.tight_layout()
     return fig
 

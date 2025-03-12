@@ -4,7 +4,6 @@ import time
 from .cuda_kernels import (
     find_intersections_between_lines_cuda,
     backproject_hits_into_lines_cuda,
-    find_intersections_between_lines_direct,
 )
 
 class LineIntersectionSolver:
@@ -247,8 +246,8 @@ class LineIntersectionSolver:
                     intersection_find_start = time.time()
                 
                 # Find intersections
-                points, indices1, indices2, distances = (
-                    find_intersections_between_lines_direct(
+                points, indices1, indices2 = (
+                    find_intersections_between_lines_cuda(
                         points1,directions1,plane_ids1,
                         points2,directions2,plane_ids2,
                         self.intersection_tolerance,

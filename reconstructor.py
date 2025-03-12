@@ -2,7 +2,10 @@ import torch
 import numpy as np
 import time
 import math
-from .cuda_kernels import project_coordinates_to_plane
+from .cuda_kernels import (
+    project_coordinates_to_plane,
+    project_coordinates_to_plane_exact,
+)
 from .intersection_solver import LineIntersectionSolver
 from tqdm import trange
 
@@ -280,7 +283,8 @@ class LArTPCReconstructor:
     
     def optimize_point_intensities(self, candidate_points, target_projections, 
                                          num_iterations=200, lr=0.01, pruning_threshold=0.05, 
-                                         pruning_interval=50, l1_weight=0.01, loss_func='l1'):
+                                         pruning_interval=50, l1_weight=0.01, loss_func='l1',
+                                         warmup_iterations=500):
         """
         Optimize the intensity values of a set of candidate 3D points to match target projections.
         Only optimizes intensity values (alpha) while keeping point positions fixed.
@@ -319,11 +323,12 @@ class LArTPCReconstructor:
         
         # Track optimization progress
         loss_values = []
+        fidelity_loss_values = []
+        l1_loss_values = []
         num_points_history = [candidate_points.shape[0]]
         current_coords = candidate_points.clone()
 
-        # Warmup iterations
-        warmup_iterations = int(0.1 * num_iterations)        
+        # Warmup iterations    
         # Optimization loop
         for iteration in trange(num_iterations):
             if self.debug and (iteration == 0 or (iteration + 1) % 20 == 0):
@@ -351,8 +356,10 @@ class LArTPCReconstructor:
                 if self.debug and (iteration == 0 or (iteration + 1) % 20 == 0):
                     print(f"    Plane {plane_id} loss: {plane_loss.item():.6f}")
             
+            fidelity_loss_values.append(loss.item())
             # Add L1 regularization for sparsity
             l1_reg = l1_weight * torch.mean(torch.abs(alpha_values))
+            l1_loss_values.append(l1_reg.item())
             loss += l1_reg
             
             # Backward pass and optimization
@@ -392,7 +399,6 @@ class LArTPCReconstructor:
                     
                     if self.debug:
                         print(f"    Pruned to {current_coords.shape[0]} points (removed {(~valid_mask).sum().item()} points)")
-                        print(f"    New learning rate: {new_lr:.6f}")
                     
                     num_points_history.append(current_coords.shape[0])
             
@@ -406,7 +412,7 @@ class LArTPCReconstructor:
             print(f"Final number of points: {current_coords.shape[0]}")
             print(f"Final loss: {loss_values[-1]:.6f}")
         
-        return current_coords, alpha_values.detach(), loss_values, num_points_history
+        return current_coords, alpha_values.detach(), [loss_values, fidelity_loss_values, l1_loss_values], num_points_history, 
 
     def reconstruct_points_from_projections(
         self,

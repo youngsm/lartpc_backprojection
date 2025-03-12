@@ -32,7 +32,7 @@ def get_input_points():
 
     # Define the original and target volume dimensions
     original_shape = (768, 768, 768)
-    target_shape = (100, 100, 100)
+    target_shape = (512, 512, 512)
 
     # Extract coordinates from input_points (first 3 columns)
     point_coords = input_points[:, :3]
@@ -302,7 +302,7 @@ def create_volume_from_points(points, volume_shape, radius=0.0, device="cuda"):
 
     return sparse_volume, dense_volume, points
 
-def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l1'):
+def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l1', deg=[0, 60, -60]):
     """
     Demonstrate a realistic sparse point-based differentiable reconstruction.
     Uses the actual backprojection process to get candidate points.
@@ -312,22 +312,24 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
     """
     print(f"Running realistic sparse point-based differentiable reconstruction using {optimization_method.upper()}...")
     
-    # Use CUDA if available
+    # use CUDA if available
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    # Create a 3D volume with a simple structure (e.g., a cube)
+    # create a 3D volume with a simple structure (e.g., a cube)
     print("Creating ground truth volume...")
-    volume_shape = (100, 100, 100)
+    volume_shape = (512, 512, 512)
     
     
-    # Create sparse ground truth
+    # create sparse ground truth
     ground_truth_sparse, ground_truth, original_points = create_volume_from_points(input_points, volume_shape, radius=0.0, device=device)
     print(f"Created ground truth with {original_points.shape[0]} non-zero points")
     
-    # Create reconstructor with three planes
+    # create reconstructor with three planes
     print("Creating reconstructor with 3 planes...")
-    plane_angles = {0: np.pi, 1: -np.pi/3, 2: np.pi/3}  # Three planes at different angles
+    # plane_angles = {0: np.pi/2, 1: np.pi/3, 2: -np.pi/3}  # Three planes at different angles
+    plane_angles = {0: np.pi*degs[0]/180, 1: np.pi*degs[1]/180, 2: np.pi*degs[2]/180}  # Three planes at different angles
+    print(f"Plane angles: {plane_angles}")
     reconstructor = LArTPCReconstructor(
         intersection_tolerance=1e-1,
         volume_shape=volume_shape, 
@@ -336,16 +338,16 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
         debug=False
     )
     
-    # Generate projections from ground truth
+    # generate 2D projections from ground truth
     print("Generating 2D projections from ground truth...")
     projections = reconstructor.project_sparse_volume(ground_truth_sparse)
     
-    # Visualize ground truth and projections
+    # visualize ground truth and projections
     print("Visualizing ground truth and projections...")
-    visualize_volume(ground_truth.cpu().numpy(), threshold=0.0).savefig(f"img/realistic_ground_truth_{optimization_method}.png")
-    visualize_projections({k: v.cpu().detach().numpy() for k, v in projections.items()}).savefig(f"img/realistic_projections_{optimization_method}.png")
+    visualize_volume(ground_truth.cpu().numpy(), threshold=0.0, title='True Trajectory').savefig(f"img/realistic_ground_truth_{optimization_method}.png")
+    visualize_projections({k: v.cpu().detach().numpy() for k, v in projections.items()}).savefig(f"img/realistic_projections_{optimization_method}.png", dpi=72)
     
-    # Threshold the projections to simulate detector hits
+    # threshold the projections to simulate detector hits
     print("Thresholding projections to simulate detector hits...")
     thresholded_projections = projections
 
@@ -355,9 +357,10 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
     for plane_id, projection in projections.items():
         thresholded_projections[plane_id] = (projection > threshold).float()
     
-    # Use the standard reconstruction process to get candidate points
+    # reconstruct candidate points using standard method
     print("Reconstructing candidate points using standard method...")
     backprojection_threshold = 0.1
+        
     candidate_points = reconstructor.reconstruct_from_projections(
         thresholded_projections, 
         threshold=backprojection_threshold,
@@ -367,23 +370,24 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
     
     print(f"Generated {candidate_points.shape[0]} candidate points from backprojection")
     
-    # Visualize candidate points
+    # visualize candidate points
     candidate_volume = torch.zeros(volume_shape, device=device)
     candidate_volume[candidate_points[:, 0].long(), candidate_points[:, 1].long(), candidate_points[:, 2].long()] = 1.0
-    visualize_volume(candidate_volume.cpu().numpy(), threshold=0.0).savefig(f"img/realistic_candidate_points_{optimization_method}.png")
+    visualize_volume(candidate_volume.cpu().numpy(), threshold=0.0, title='Candidate Points').savefig(f"img/realistic_candidate_points_{optimization_method}.png", dpi=72)
     
-    # Optimize the intensities of these candidate points
+    # optimize the intensities of these candidate points
     print(f"Optimizing intensities of candidate points using {optimization_method.upper()}...")
     
-    # Convert candidate points to long for indexing
+    # convert candidate points to long for indexing
     candidate_points_long = candidate_points.long()
     
-    # Optimization parameters
-    num_iterations = 5000 if optimization_method == 'adam' else 200  # ADMM typically needs fewer iterations
+    # optimization 1000
+    num_iterations = 2000
     learning_rate = 0.01
     pruning_threshold = 0.001
-    pruning_interval = 1000 if optimization_method == 'adam' else 10000
-    l1_weight = 0.001
+    warmup_iterations = 300
+    pruning_interval = 200
+    l1_weight = 0.01
     
     # Run optimization with the specified method
     # Use Adam (SGD) optimization
@@ -391,6 +395,7 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
         candidate_points=candidate_points_long,
         target_projections=projections,
         num_iterations=num_iterations,
+        warmup_iterations=warmup_iterations,
         lr=learning_rate,
         pruning_threshold=pruning_threshold,
         pruning_interval=pruning_interval,
@@ -402,46 +407,37 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
     final_volume = torch.zeros(volume_shape, device=device)
     final_volume[optimized_coords[:, 0], optimized_coords[:, 1], optimized_coords[:, 2]] = optimized_values
     
-    # Calculate metrics
+    # calculate metrics
     metrics = reconstructor.evaluate_reconstruction(ground_truth, final_volume, threshold=0.0)
     
-    # Visualize final results
+    # visualize final results
     print("Visualizing final results...")
-    visualize_volume(final_volume.cpu().numpy(), threshold=0.0).savefig(f"img/realistic_final_volume_{optimization_method}.png")
-    
-    # Compare original and reconstructed
-    fig = visualize_original_vs_reconstructed(
-        ground_truth.cpu().numpy(), 
-        final_volume.cpu().numpy(), 
-        # threshold=0.1
-    )
-    fig.savefig(f"img/realistic_original_vs_reconstructed_{optimization_method}.png")
-    plt.close(fig)
-    
-    # Visualize comparison of projections
+    visualize_volume(final_volume.cpu().numpy(), threshold=0.0, title='Reconstructed Trajectory').savefig(f"img/realistic_final_volume_{optimization_method}.png", dpi=72)
+        
+    # visualize comparison of projections
     final_projections = reconstructor.project_sparse_volume(
         (optimized_coords, optimized_values, volume_shape)
     )
     
-    # Create a figure to compare original and final projections
+    # create a figure to compare original and final projections
     for norm in [None, LogNorm()]:
         fig, axes = plt.subplots(3, 3, figsize=(18, 12))
         
         for i, plane_id in enumerate(projections):
-            # Original projection
+            # original projection
             orig_proj = projections[plane_id].cpu().detach().numpy()
             
-            # Optimized projection
+            # optimized projection
             final_proj = final_projections[plane_id].cpu().detach().numpy()
             
-            # Difference projection
+            # difference projection
             diff_proj = final_proj - orig_proj
             
-            # Find common min/max for consistent colorbar
+            # find common min/max for consistent colorbar
             vmin = min(orig_proj.min(), final_proj.min())
             vmax = max(orig_proj.max(), final_proj.max())
             
-            # Original projection
+            # original projection
             im = axes[i, 0].imshow(
                 orig_proj,
                 aspect='auto',
@@ -454,7 +450,7 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
             axes[i, 0].set_title(f"Original Projection (Plane {plane_id})")
             plt.colorbar(im, ax=axes[i, 0])
             
-            # Optimized projection
+            # optimized projection
             im_final = axes[i, 1].imshow(
                 final_proj,
                 aspect='auto',
@@ -467,15 +463,15 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
             axes[i, 1].set_title(f"Optimized Projection (Plane {plane_id})")
             plt.colorbar(im_final, ax=axes[i, 1])
             
-            # Difference projection
+            # difference projection
             diff_max = max(abs(diff_proj.min()), abs(diff_proj.max()))
             im_diff = axes[i, 2].imshow(
                 diff_proj,
                 aspect='auto',
                 cmap='bwr',
                 interpolation='none',
-                vmin=-diff_max,
-                vmax=diff_max
+                vmin=-1e-4,
+                vmax=1e-4,
             )
             axes[i, 2].set_title(f"Difference (Plane {plane_id})")
             plt.colorbar(im_diff, ax=axes[i, 2])
@@ -485,9 +481,9 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
         plt.close()
 
 
-    # Calculate how many original points are included in the reconstruction
-    # An original point is considered "included" if there's a reconstructed point close to it
-    inclusion_threshold = 1.0  # Maximum distance for a point to be considered included
+    # calculate how many original points are included in the reconstruction
+    # an original point is considered "included" if there's a reconstructed point close to it
+    inclusion_threshold = 1.0  # maximum distance for a point to be considered included
     original_points_array = torch.stack(original_points) if isinstance(original_points, list) else original_points
     total_original_points = len(original_points_array)
     
@@ -506,10 +502,11 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
     print(f"  Total original points: {total_original_points}")
     print(f"  Original points included in reconstruction: {included_count} ({inclusion_percentage:.2f}%)")
     
-    # Add this information to the title of the loss curve
-    # Plot loss curve
+    # plot loss curve
     plt.figure(figsize=(10, 6))
-    plt.plot(loss_history)
+    plt.plot(loss_history[0], label='Total Loss')
+    plt.plot(loss_history[1], label=f'Fidelity ({loss_func.upper()}) Loss')
+    plt.plot(loss_history[2], label='L1 Regularization')
     plt.title(f'Loss During {optimization_method.upper()} Optimization\n'
               f'Original: {total_original_points} points, '
               f'Included: {included_count} ({inclusion_percentage:.2f}%)')
@@ -517,10 +514,14 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
     plt.ylabel('Loss')
     plt.yscale('log')
     plt.grid(True)
-    plt.savefig(f"img/realistic_optimization_loss_{optimization_method}.png")
+    # plt.ylim(1e-4, None)
+    plt.legend(frameon=False, bbox_to_anchor=(1.01, 1), loc='upper left')
+    plt.xlim(0, num_iterations)
+    plt.tight_layout()
+    plt.savefig(f"img/realistic_optimization_loss_{optimization_method}.png", dpi=72)
     plt.close()
     
-    # Plot number of points over iterations
+    # plot number of points over iterations
     pruning_iterations = [i * pruning_interval for i in range(len(num_points_history))]
     plt.figure(figsize=(10, 6))
     plt.plot(pruning_iterations, num_points_history, 'o-')
@@ -530,25 +531,88 @@ def run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l
     plt.xlabel('Iteration')
     plt.ylabel('Number of Points')
     plt.grid(True)
-    plt.savefig(f"img/realistic_points_history_{optimization_method}.png")
+    plt.savefig(f"img/realistic_points_history_{optimization_method}.png", dpi=72)
     plt.close()
     
-    # Print a summary of the metrics, including non-zero PSNR
+    # summary of the metrics, including non-zero PSNR
     print(f"\nMetrics for {optimization_method.upper()} reconstruction:")
-    # Standard metrics
+    # standard metrics yada yada
     standard_metrics = ['iou', 'dice', 'precision', 'recall', 'f1', 'mse', 'psnr']
     for metric_name in standard_metrics:
         if metric_name in metrics:
             print(f"  {metric_name}: {metrics[metric_name]:.6f}")
     
-    # Non-zero metrics with emphasis
+    # non-zero metrics
     special_metrics = ['mse_nonzero', 'psnr_nonzero']
     if any(m in metrics for m in special_metrics):
         print("\n  Non-zero region metrics (only considering pixels where reconstructed or truth > 0):")
         for metric_name in special_metrics:
             if metric_name in metrics:
                 print(f"    {metric_name}: {metrics[metric_name]:.6f}")
-        
+
+    # energy reco compared to truth
+    print("Energy decomposition in volume:")
+    print(f"  Total energy in ground truth: {torch.sum(ground_truth).item():.2f} MeV")
+    print(f"  Total energy in reconstructed: {torch.sum(final_volume).item():.2f} MeV")
+    print(f"  Energy ratio: {torch.sum(final_volume).item() / torch.sum(ground_truth).item():.2f}")
+
+    # Create histograms of nonzero energy distributions
+    plt.figure(figsize=(10, 6))
+    
+    # Get nonzero values from ground truth and reconstructed volumes
+    gt_nonzero = ground_truth[ground_truth > 0].cpu().numpy()
+    recon_nonzero = final_volume[final_volume > 0].cpu().numpy()
+    
+    # Plot histograms
+    plt.hist(
+        gt_nonzero, 
+        bins=np.linspace(0, 2, 20), 
+        alpha=0.5, 
+        label=f'Ground Truth (n={len(gt_nonzero)})',
+        density=True
+    )
+    plt.hist(
+        recon_nonzero, 
+        bins=np.linspace(0, 2, 20), 
+        alpha=0.5, 
+        label=f'Reconstructed (n={len(recon_nonzero)})',
+        density=True
+    )
+    
+    plt.title('Distribution of Nonzero Energy Values')
+    plt.xlabel('Energy Value')
+    plt.ylabel('Frequency (normalized)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"img/realistic_energy_distribution_{optimization_method}.png", dpi=72)
+    plt.close()
+    
+    # Create histogram of residuals (only where either volume has nonzero values)
+    plt.figure(figsize=(10, 6))
+    
+    # Create masks for nonzero values in either volume
+    nonzero_mask = (ground_truth > 0) | (final_volume > 0)
+    
+    # Calculate residuals where either volume has nonzero values
+    residuals = (final_volume - ground_truth)[nonzero_mask].cpu().numpy()
+    
+    plt.hist(
+        residuals, 
+        bins=np.linspace(-2, 2, 20), 
+        alpha=0.7, 
+        label=f'Residuals (n={len(residuals)})'
+    )
+    
+    plt.title('Residuals of Reconstructed - Ground Truth Energy Values')
+    plt.xlabel('Residual Value (Reconstructed - Ground Truth)')
+    plt.ylabel('Frequency')
+    plt.axvline(x=0, color='r', linestyle='--', alpha=0.7)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"img/realistic_energy_residuals_{optimization_method}.png", dpi=72)
+    plt.close()
+
+
     return metrics, final_volume
 
 # If this script is run directly, run the example
@@ -557,7 +621,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Run realistic sparse reconstruction example')
     parser.add_argument('--method', type=str, choices=['adam'], default='adam',
                         help='Optimization method to use: adam, admm, or both')
+    parser.add_argument('--deg', type=str, default='0,60,-60',
+                        help='Projection angles in degrees for the three planes as comma-separated values (default: 0,60,-60)')
     args = parser.parse_args()
+    degs = [float(d) for d in args.deg.split(',')]
     
     # Create img directory if it doesn't exist
     os.makedirs('img', exist_ok=True)
@@ -580,6 +647,6 @@ if __name__ == "__main__":
     
     if args.method == 'adam':
         # Run with Adam only
-        run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l1')
+        run_realistic_sparse_reconstruction(optimization_method='adam', loss_func='l1', deg=degs)
     else:  # 'both'
         raise ValueError("Invalid method: only adam supported for now")

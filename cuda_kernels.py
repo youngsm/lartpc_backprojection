@@ -191,7 +191,91 @@ def project_coordinates_to_plane(coords, values, volume_shape, theta, u_min, dev
     projection = (lower_contribution + upper_contribution).to_dense()    
     return projection
 
-def find_intersections_between_lines(
+def project_coordinates_to_plane_exact(
+    coords, values, volume_shape, theta, u_min, device="cuda", projection_size=None
+):
+    """
+    Project a sparse 3D volume to a 2D plane assuming exact mapping to integer U coordinates.
+    This version removes bilinear interpolation for better performance when coordinates align with grid.
+
+    Args:
+        coords (torch.Tensor): Coordinates of non-zero voxels (N, 3)
+        values (torch.Tensor): Values of non-zero voxels (N)
+        volume_shape (tuple): Shape of the volume (x_size, y_size, z_size)
+        theta (float): Projection angle in radians
+        u_min (float): Minimum u-coordinate
+        device (str): Device to use for computation
+        projection_size (tuple, optional): Size of the projection (x_size, u_size)
+
+    Returns:
+        torch.Tensor: Projection of shape (x_size, u_size)
+    """
+    # Edge case: empty volume
+    if coords.shape[0] == 0:
+        if projection_size is not None:
+            return torch.zeros(projection_size, device=device)
+        return torch.zeros((volume_shape[0], 1), device=device)
+
+    # Sort coordinates for better memory access patterns
+    sorted_indices = torch.argsort(coords[:, 0])
+    sorted_coords = coords[sorted_indices]
+    sorted_values = values[sorted_indices]
+
+    # Determine projection dimensions
+    x_size = volume_shape[0]
+
+    if projection_size is None:
+        # Automatically determine projection size
+        max_y = volume_shape[1] - 1
+        max_z = volume_shape[2] - 1
+
+        sin_theta = torch.sin(torch.tensor(theta, device=device))
+        cos_theta = torch.cos(torch.tensor(theta, device=device))
+        u_max = -max_y * sin_theta + max_z * cos_theta
+
+        u_size = int(torch.ceil(u_max - u_min).item()) + 1
+        projection_size = (x_size, u_size)
+    else:
+        x_size, u_size = projection_size
+
+    # Get needed trig values
+    sin_theta = torch.sin(torch.tensor(theta, device=device))
+    cos_theta = torch.cos(torch.tensor(theta, device=device))
+
+    # Calculate u coordinates for each point and round to nearest integer
+    u_coords = (
+        -sorted_coords[:, 1] * sin_theta + sorted_coords[:, 2] * cos_theta - u_min
+    )
+    u_indices = torch.round(u_coords).long()
+
+    # Get x indices
+    x_indices = sorted_coords[:, 0].long()
+
+    # Filter out indices that would be outside the projection
+    valid_mask = (
+        (x_indices >= 0)
+        & (x_indices < x_size)
+        & (u_indices >= 0)
+        & (u_indices < u_size)
+    )
+
+    # Create sparse tensor for the projection
+    if valid_mask.any():
+        indices = torch.stack([x_indices[valid_mask], u_indices[valid_mask]], dim=0)
+        projection_values = sorted_values[valid_mask]
+
+        # Handle duplicate indices by summing the values
+        projection_sparse = torch.sparse_coo_tensor(
+            indices, projection_values, size=(x_size, u_size), device=device
+        ).coalesce()  # Coalesce sums duplicate indices
+
+        projection = projection_sparse.to_dense()
+    else:
+        projection = torch.zeros(projection_size, device=device)
+
+    return projection
+
+def find_intersections_between_lines_cuda(
     points1,
     directions1,
     plane_ids1,
