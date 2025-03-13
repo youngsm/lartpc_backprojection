@@ -1,5 +1,4 @@
 from .cuda_kernels import (
-    closest_points_between_lines_cuda,
     find_intersections_between_lines_cuda,
     backproject_hits_into_lines_cuda,
     project_coordinates_to_plane,

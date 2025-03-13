@@ -324,7 +324,7 @@ class LineIntersectionSolver:
                 filtered_count = intersection_points.size(0) - points_in_bounds.size(0)
                 if filtered_count > 0:
                     print(f"  Filtered out {filtered_count} points outside volume bounds")
-                print(f"  Final reconstructed points: {points_in_bounds.size(0)}")
+                print(f"  Final reconstructed points: {points_in_bounds.size(0)} in {time.time() - start_time:.2f} seconds")
             
             return points_in_bounds
         else:

@@ -68,7 +68,7 @@ def backproject_hits_into_lines_cuda(projection_data, theta, u_min, volume_shape
     
     return points, directions, plane_ids
 
-def project_coordinates_to_plane(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None, differentiable=False):
+def project_coordinates_to_plane(coords, values, volume_shape, theta, u_min, device='cuda', projection_size=None):
     """
     Unified function to project a sparse 3D volume to a 2D plane with optional diffusion effects.
     Supports both standard and differentiable projection modes.
@@ -81,7 +81,6 @@ def project_coordinates_to_plane(coords, values, volume_shape, theta, u_min, dev
         u_min (float): Minimum u-coordinate
         device (str): Device to use for computation
         projection_size (tuple, optional): Size of the projection (x_size, u_size)
-        differentiable (bool): Whether to use differentiable projection mode
         
     Returns:
         torch.Tensor: Projection of shape (x_size, u_size)
@@ -287,7 +286,6 @@ def find_intersections_between_lines_cuda(
     debug=False,
     snap_to_grid=True,
     voxel_size=1.0,
-    return_distances=False,
 ):
     """
     Find intersections between two sets of lines using direct solving.

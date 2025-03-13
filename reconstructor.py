@@ -86,7 +86,6 @@ class LArTPCReconstructor:
             u_min = self.solver.u_min_values[plane_id]
             projection_size = self.solver.projection_sizes[plane_id]
             
-            # Use unified sparse projection with differentiable=True
             projection = project_coordinates_to_plane(
                 coords=coords,
                 values=values,
@@ -664,7 +663,6 @@ class LArTPCReconstructor:
                 + all_coords[:, 2]
             )
 
-            # Use PyTorch's scatter_reduce operation to handle duplicates
             # Create a sparse tensor representation
             sparse_dims = torch.prod(torch.tensor(self.volume_shape)).item()
             sparse_tensor = torch.zeros(sparse_dims, device=self.device)
