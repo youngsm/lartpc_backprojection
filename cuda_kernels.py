@@ -303,18 +303,23 @@ def find_intersections_between_lines_cuda(
     For lines in the same x-plane, this becomes a 2D problem in the y-z plane,
     represented as a linear system:
 
-    [  d_1y  d_2y ] [ t_1 ] = [ p_2y - p_1y ]
-    [  d_1z  d_2z ] [ t_2 ] = [ p_2z - p_1z ]
+    [  d_1y  -d_2y ] [ t_1 ] = [ p_2y - p_1y ]
+    [  d_1z  -d_2z ] [ t_2 ] = [ p_2z - p_1z ]
 
     Using Cramer's rule, the solution is:
 
-                      | p_2y-p_1y  d_2y |                     | d_1y  p_2y-p_1y |
-    t_1 = det(A)^-1 * | p_2z-p_1z  d_2z |,  t_2 = det(A)^-1 * | d_1z  p_2z-p_1z |
+                      | p_2y-p_1y  -d_2y |                     | d_1y  p_2y-p_1y |
+    t_1 = det(A)^-1 * | p_2z-p_1z  -d_2z |,  t_2 = det(A)^-1 * | d_1z  p_2z-p_1z |
 
     where det(A) = d_1y * d_2z - d_2y * d_1z
 
     Once t_1 and t_2 are found, the intersection point is:
     p_intersect = p_1 + t_1 * d_1 = p_2 + t_2 * d_2
+
+    If the lines truly intersect, then the above equation is true. If they don't actually
+    intersect, then p_1 + t_1 * d_1 will give the point on line 1 of closest approach to line 2,
+    and p_2 + t_2 * d_2 will give the point on line 2 of closest approach to line 1. In this case,
+    we'd just take the average of the two points as the intersection point.
 
     Args:
         points1 (torch.Tensor): Points on the first set of lines (N, 3)
