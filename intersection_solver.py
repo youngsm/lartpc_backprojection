@@ -2,8 +2,8 @@ import numpy as np
 import torch
 import time
 from .cuda_kernels import (
-    find_intersections_between_lines_cuda,
-    backproject_hits_into_lines_cuda,
+    find_intersections_between_lines,
+    backproject_hits_into_lines,
 )
 
 class LineIntersectionSolver:
@@ -152,7 +152,7 @@ class LineIntersectionSolver:
             print(f"  Projection shape: {projection_data.shape}")
             print(f"  Non-zero hits: {torch.count_nonzero(projection_data).item()}")
         
-        points, directions, plane_ids = backproject_hits_into_lines_cuda(
+        points, directions, plane_ids = backproject_hits_into_lines(
             projection_data,
             theta,
             u_min,
@@ -247,7 +247,7 @@ class LineIntersectionSolver:
                 
                 # Find intersections
                 points, indices1, indices2 = (
-                    find_intersections_between_lines_cuda(
+                    find_intersections_between_lines(
                         points1,directions1,plane_ids1,
                         points2,directions2,plane_ids2,
                         self.intersection_tolerance,

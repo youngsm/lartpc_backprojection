@@ -3,9 +3,9 @@ import torch
 import math
 import time
 
-def backproject_hits_into_lines_cuda(projection_data, theta, u_min, volume_shape, device="cuda", plane_id=None):
+def backproject_hits_into_lines(projection_data, theta, u_min, volume_shape, device="cuda", plane_id=None):
     """
-    Backproject 2D hits into 3D lines using CUDA.
+    Backproject 2D hits into 3D lines.
     
     Args:
         projection_data (torch.Tensor): 2D projection data (x, u)
@@ -274,7 +274,7 @@ def project_coordinates_to_plane_exact(
 
     return projection
 
-def find_intersections_between_lines_cuda(
+def find_intersections_between_lines(
     points1,
     directions1,
     plane_ids1,
@@ -290,7 +290,7 @@ def find_intersections_between_lines_cuda(
     """
     Find intersections between two sets of lines using direct solving.
 
-    This is fine when the lines are in the same x-plane, but not when they are not.
+    This is fine when the lines are in the same x-plane (exactly in time), but not when they are not.
     In this project, they are. But in real life, they are certainly not.
 
     ---
