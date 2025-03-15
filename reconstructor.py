@@ -161,7 +161,7 @@ class LArTPCReconstructor:
         
         return reconstructed_points
         
-    def reconstruct_coords_from_projections(self, projections, threshold=0.1, voxel_size=1.0, use_gaussian=False, sigma=1.0, snap_to_grid=True):
+    def reconstruct_coords_from_projections(self, projections, threshold=1e-2, voxel_size=1.0, use_gaussian=False, sigma=1.0, snap_to_grid=True):
         """
         Reconstruct a sparse 3D volume from 2D projections by placing voxels at intersection points.
 
@@ -416,7 +416,7 @@ class LArTPCReconstructor:
     def reconstruct_points_from_projections(
         self,
         projections,
-        threshold=0.1,
+        threshold=1e-2,
         num_iterations=200,
         lr=0.01,
         pruning_threshold=0.05,
@@ -424,11 +424,14 @@ class LArTPCReconstructor:
         l1_weight=0.01,
         loss_func="l1",
         snap_to_grid=True,
+        voxel_size=1.0,
     ):
         """
         Reconstruct 3D points from 2D projections.
         """
-        points = self.reconstruct_from_projections(projections, threshold, snap_to_grid=True)
+        points = self.reconstruct_from_projections(
+            projections, threshold, snap_to_grid=snap_to_grid, voxel_size=voxel_size
+        )
 
         final_coords, alpha_values, loss_values, num_points_history = self.optimize_point_intensities(points,
                                                                                                       projections,
