@@ -93,7 +93,7 @@ this will return a dictionary containing each projection.
 
 The `examples/` directory contains a couple scripts I used to evaluate this algorithm. The notebook contains code I used in the early stages of this project, and will probably not run. `realistic_sparse_reconstruction.py` is a script that runs full reconstruction on a single LArTPC image, and print out helpful evaluation metrics and saves pretty plots to look at. `line_visualization.py` attempts to visualize the wire planes but it's very finicky.
 
-### Datraset
+### Dataset
 
 The dataset used for this project is the PILArNet-M dataset, which can be found at this [Github link](https://github.com/DeepLearnPhysics/PoLAr-MAE/blob/main/DATASET.md).
 ___
